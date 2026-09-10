@@ -17,6 +17,7 @@ use smithay::backend::input::{InputTime, KeyState};
 use smithay::desktop::{Window, WindowSurface};
 use smithay::input::Seat;
 use smithay::input::keyboard::{KeyboardTarget, KeysymHandle, ModifiersState};
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{IsAlive, Serial};
 use smithay::wayland::seat::WaylandFocus;
@@ -296,6 +297,10 @@ pub(crate) struct FocusState {
 	/// X11 window ID that most recently sent `_NET_ACTIVE_WINDOW`.
 	/// Cleared after being consumed by `pick_best_candidate`.
 	requested_focus_window: Option<u32>,
+	/// Wayland surface that most recently requested activation via
+	/// `xdg-activation` (the Wayland analog of `_NET_ACTIVE_WINDOW`).
+	/// Cleared after being consumed by `pick_best_candidate`.
+	requested_focus_surface: Option<WlSurface>,
 }
 
 impl FocusState {
@@ -336,6 +341,24 @@ impl FocusState {
 	/// Clear the pending `_NET_ACTIVE_WINDOW` focus request.
 	pub fn clear_requested_focus(&mut self) {
 		self.requested_focus_window = None;
+	}
+
+	/// Store an explicit focus request from an `xdg-activation` request.
+	/// Replaces any previously pending surface request.
+	pub fn set_requested_focus_surface(&mut self, surface: WlSurface) {
+		tracing::debug!(target: "focus", surface_id = ?surface.id(), "xdg-activation: storing explicit focus request");
+		self.requested_focus_surface = Some(surface);
+		self.mark_dirty();
+	}
+
+	/// Peek at the pending `xdg-activation` focus request without consuming it.
+	pub fn peek_requested_focus_surface(&self) -> Option<&WlSurface> {
+		self.requested_focus_surface.as_ref()
+	}
+
+	/// Clear the pending `xdg-activation` focus request.
+	pub fn clear_requested_focus_surface(&mut self) {
+		self.requested_focus_surface = None;
 	}
 }
 

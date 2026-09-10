@@ -31,6 +31,9 @@ use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::data_device::{DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler};
 use smithay::wayland::shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState};
 use smithay::wayland::shm::{ShmHandler, ShmState};
+use smithay::wayland::xdg_activation::{
+	XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+};
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
 use smithay::xwayland::xwm::{Reorder, ResizeEdge, XwmId};
 use smithay::xwayland::{X11Surface, X11Wm, XwmHandler};
@@ -366,6 +369,12 @@ impl CompositorHandler for MoonshineCompositor {
 			cm.commit(surface);
 		}
 
+		// Whether this surface already had a buffer before this commit, to
+		// detect its first presentation below.
+		let had_buffer =
+			smithay::backend::renderer::utils::with_renderer_surface_state(surface, |st| st.buffer().is_some())
+				.unwrap_or(false);
+
 		// Initialize RendererSurfaceState for this surface so that
 		// space_render_elements can produce render elements from the
 		// attached buffer. Without this call surfaces appear bufferless
@@ -375,6 +384,23 @@ impl CompositorHandler for MoonshineCompositor {
 		// Ensure the surface is not a pending sync subsurface.
 		if is_sync_subsurface(surface) {
 			return;
+		}
+
+		// Re-evaluate focus when a window presents its first buffer. The
+		// focus-ready gate in `build_candidates` holds focus on the Steam UI
+		// until the game presents; without this trigger a game that maps
+		// bufferless stays excluded from the candidates forever, so its
+		// keyboard focus never moves and keyboard input goes nowhere.
+		if !had_buffer
+			&& smithay::backend::renderer::utils::with_renderer_surface_state(surface, |st| st.buffer().is_some())
+				.unwrap_or(false)
+			&& (self
+				.space
+				.elements()
+				.any(|w| w.wl_surface().is_some_and(|s| &*s == surface))
+				|| self.override_surface.as_ref().is_some_and(|(s, _)| s == surface))
+		{
+			self.reevaluate_focus();
 		}
 
 		// If the surface is a toplevel, refresh the space.
@@ -787,6 +813,42 @@ impl MoonshineCompositor {
 		}
 	}
 
+	/// Whether a window currently has a committed buffer to present.
+	///
+	/// Checks the window's own surface (Wayland-native or X11/XWayland) and
+	/// the WSI override surface, which games present their Vulkan frames
+	/// through instead of their window surface.
+	fn window_has_buffer(&self, window: &Window) -> bool {
+		let surface_has_buffer = |s: &WlSurface| {
+			smithay::backend::renderer::utils::with_renderer_surface_state(s, |st| st.buffer().is_some())
+				.unwrap_or(false)
+		};
+		if window.wl_surface().is_some_and(|s| surface_has_buffer(&s)) {
+			return true;
+		}
+		let x11_id = window.x11_surface().map(|x| x.window_id());
+		self.override_surface
+			.as_ref()
+			.is_some_and(|(s, oxid)| Some(*oxid) == x11_id && s.is_alive() && surface_has_buffer(s))
+	}
+
+	/// Whether an explicit focus request for `requested` should be deferred
+	/// because the current focus is the Steam UI and `requested` is not
+	/// presenting yet — the BPM launch UI keeps focus until the game presents.
+	/// Once `requested` presents a buffer, the request is honored.
+	fn defer_focus_to_steam_ui(&self, requested: &Window) -> bool {
+		let current_is_steam_ui = self
+			.focused_x11_window
+			.and_then(|fid| {
+				self.space
+					.elements()
+					.find(|we| we.x11_surface().is_some_and(|x| x.window_id() == fid))
+			})
+			.and_then(|fw| self.window_metadata.get(fw))
+			.is_some_and(|m| m.is_steam_big_picture() || m.app_id == super::x11_focus::STEAM_BIG_PICTURE_APPID);
+		current_is_steam_ui && !self.window_has_buffer(requested)
+	}
+
 	/// Build the list of focus candidates by filtering out special windows.
 	///
 	/// Gamescope: `GetPossibleFocusWindows` — skips isSysTrayIcon, isOverlay,
@@ -821,20 +883,7 @@ impl MoonshineCompositor {
 				// A window that hasn't committed a buffer isn't ready to take focus
 				// (the Steam launch UI keeps focus until the game presents).
 				let is_current_focus = self.focused_x11_window == window.x11_surface().map(|x| x.window_id());
-				let x11_id = window.x11_surface().map(|x| x.window_id());
-				let surface_has_buffer = |s: &WlSurface| {
-					smithay::backend::renderer::utils::with_renderer_surface_state(s, |st| st.buffer().is_some())
-						.unwrap_or(false)
-				};
-				let has_buffer = window
-					.x11_surface()
-					.and_then(|x| x.wl_surface())
-					.map(|s| surface_has_buffer(&s))
-					.unwrap_or(false)
-					// Game may present via the WSI override surface instead.
-					|| self.override_surface.as_ref().is_some_and(|(s, oxid)| {
-						Some(*oxid) == x11_id && s.is_alive() && surface_has_buffer(s)
-					});
+				let has_buffer = self.window_has_buffer(window);
 				if !is_current_focus && !has_buffer {
 					tracing::debug!(
 						target: "focus",
@@ -881,20 +930,11 @@ impl MoonshineCompositor {
 			{
 				// Don't steal focus from a Steam UI window (gamescope only raises
 				// on _NET_ACTIVE_WINDOW; the BPM launch UI keeps focus).
-				let current_is_steam_ui = self
-					.focused_x11_window
-					.and_then(|fid| {
-						self.space
-							.elements()
-							.find(|we| we.x11_surface().is_some_and(|x| x.window_id() == fid))
-					})
-					.and_then(|fw| self.window_metadata.get(fw))
-					.is_some_and(|m| m.is_steam_big_picture() || m.app_id == super::x11_focus::STEAM_BIG_PICTURE_APPID);
-				if current_is_steam_ui {
+				if self.defer_focus_to_steam_ui(w) {
 					tracing::debug!(
 						target: "focus",
 						window_id = requested_id,
-						"_NET_ACTIVE_WINDOW: ignoring (current focus is Steam UI, gamescope-style)"
+						"_NET_ACTIVE_WINDOW: ignoring (current focus is Steam UI, requested window not presenting yet)"
 					);
 					self.focus_state.clear_requested_focus();
 				} else {
@@ -917,6 +957,55 @@ impl MoonshineCompositor {
 				exists_but_filtered,
 				"_NET_ACTIVE_WINDOW: requested window not in candidates, preserving request"
 			);
+		}
+
+		// Honor any pending `xdg-activation` focus request — the Wayland analog
+		// of `_NET_ACTIVE_WINDOW`. Wayland-native games (e.g. Proton with
+		// PROTON_ENABLE_WAYLAND=1) cannot send the X11 message, so this is their
+		// only way to request focus. Unlike `_NET_ACTIVE_WINDOW` (which Wine
+		// re-sends), `xdg-activation` is a one-shot event, so the request stays
+		// sticky until the window is gone — otherwise the next (unrelated)
+		// focus re-evaluation would revert focus to the Steam UI via Steam's
+		// focus-control ordering, which never reorders under Moonshine.
+		if let Some(requested_surface) = self.focus_state.peek_requested_focus_surface().cloned() {
+			if let Some(w) = candidates
+				.iter()
+				.find(|w| w.wl_surface().is_some_and(|s| *s == requested_surface))
+			{
+				if self.defer_focus_to_steam_ui(w) {
+					// Keep the request pending until the window presents.
+					tracing::debug!(
+						target: "focus",
+						surface_id = ?requested_surface.id(),
+						"xdg-activation: deferring (current focus is Steam UI, requested window not presenting yet)"
+					);
+				} else {
+					tracing::debug!(
+						target: "focus",
+						surface_id = ?requested_surface.id(),
+						"xdg-activation: honoring explicit focus request"
+					);
+					return Some(w);
+				}
+			} else if self
+				.space
+				.elements()
+				.any(|w| w.wl_surface().is_some_and(|s| *s == requested_surface))
+			{
+				tracing::debug!(
+					target: "focus",
+					surface_id = ?requested_surface.id(),
+					"xdg-activation: requested surface not in candidates, preserving request"
+				);
+			} else {
+				// The window is gone — drop the sticky request.
+				tracing::debug!(
+					target: "focus",
+					surface_id = ?requested_surface.id(),
+					"xdg-activation: requested surface gone, clearing request"
+				);
+				self.focus_state.clear_requested_focus_surface();
+			}
 		}
 
 		// Check Steam focus control via X11 root window properties.
@@ -1096,7 +1185,8 @@ impl MoonshineCompositor {
 			if let Some(ref target) = keyboard_target {
 				tracing::debug!(
 					target: "focus",
-					keyboard_focus = ?target.x11_surface().map(|x| x.window_id()),
+					x11_id = ?target.x11_surface().map(|x| x.window_id()),
+					wl_surface = ?target.wl_surface().map(|s| s.id()),
 					"Setting keyboard focus"
 				);
 				keyboard.set_focus(self, Some(KeyboardFocusTarget::from(target.clone())), serial);
@@ -1676,6 +1766,41 @@ impl PointerConstraintsHandler for MoonshineCompositor {
 			// the game calls SetCursorPos to reset the cursor to center).
 			self.cursor_position = new_pos;
 		}
+	}
+}
+
+// -- XDG Activation Handler --
+
+impl XdgActivationHandler for MoonshineCompositor {
+	fn activation_state(&mut self) -> &mut XdgActivationState {
+		&mut self.activation_state
+	}
+
+	fn request_activation(
+		&mut self,
+		token: XdgActivationToken,
+		token_data: XdgActivationTokenData,
+		surface: WlSurface,
+	) {
+		// Ignore stale tokens (e.g. replayed portal/clipboard tokens).
+		if token_data.timestamp.elapsed() > std::time::Duration::from_secs(10) {
+			tracing::debug!(target: "focus", token = token.as_str(), "xdg-activation: ignoring stale token");
+			return;
+		}
+		// Only track surfaces that belong to a toplevel window we manage.
+		if self.find_window_by_surface(&surface).is_none() {
+			tracing::debug!(target: "focus", surface_id = ?surface.id(), "xdg-activation: surface has no toplevel window");
+			return;
+		}
+		tracing::debug!(
+			target: "focus",
+			token = token.as_str(),
+			surface_id = ?surface.id(),
+			app_id = ?token_data.app_id,
+			"xdg-activation: activation requested"
+		);
+		self.focus_state.set_requested_focus_surface(surface);
+		self.reevaluate_focus();
 	}
 }
 

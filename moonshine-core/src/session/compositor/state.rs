@@ -49,6 +49,7 @@ use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::tablet_manager::TabletManagerState;
+use smithay::wayland::xdg_activation::XdgActivationState;
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::X11Wm;
 
@@ -207,6 +208,9 @@ pub(crate) struct MoonshineCompositor {
 	pub seat_state: SeatState<Self>,
 	pub output_manager_state: OutputManagerState,
 	pub data_device_state: DataDeviceState,
+	/// Wayland `xdg-activation` state, the Wayland analog of X11's
+	/// `_NET_ACTIVE_WINDOW`: clients request focus through it.
+	pub activation_state: XdgActivationState,
 
 	// -- Rendering --
 	pub output: Output,
@@ -454,6 +458,7 @@ impl MoonshineCompositor {
 		let mut seat_state = SeatState::new();
 		let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
 		let data_device_state = DataDeviceState::new::<Self>(&display_handle);
+		let activation_state = XdgActivationState::new::<Self>(&display_handle);
 		let xwayland_shell_state = XWaylandShellState::new::<Self>(&display_handle);
 		RelativePointerManagerState::new::<Self>(&display_handle);
 		PointerConstraintsState::new::<Self>(&display_handle);
@@ -592,6 +597,7 @@ impl MoonshineCompositor {
 				seat_state,
 				output_manager_state,
 				data_device_state,
+				activation_state,
 				output,
 				damage_tracker,
 				allocator,
