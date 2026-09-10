@@ -5,15 +5,19 @@
 //! Smithay `Seat` — no libei or EIS socket needed.
 
 use smithay::backend::input::{
-	Axis, ButtonState, KeyState, TabletToolCapabilities, TabletToolDescriptor, TabletToolType, TouchSlot,
+	Axis, ButtonState, InputTime, KeyState, TabletToolCapabilities, TabletToolDescriptor, TabletToolType, TouchSlot,
 };
 use smithay::desktop::WindowSurfaceType;
 use smithay::input::keyboard::{FilterResult, KeyboardHandle, Keycode, xkb};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
+use smithay::input::tablet::TabletSeatTrait;
+use smithay::input::tablet::tool::{
+	AxisFrame as TabletAxisFrame, ButtonEvent as TabletButtonEvent, DownEvent as TabletDownEvent,
+	MotionEvent as TabletMotionEvent, ProximityInEvent, ProximityOutEvent, TabletToolHandle, UpEvent as TabletUpEvent,
+};
 use smithay::input::touch::{DownEvent as TouchDownEvent, MotionEvent as TouchMotionEvent, UpEvent as TouchUpEvent};
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 use smithay::wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint};
-use smithay::wayland::tablet_manager::{TabletSeatTrait, TabletToolHandle};
 
 use crate::session::compositor::state::MoonshineCompositor;
 
@@ -102,7 +106,7 @@ pub(crate) enum CompositorInputEvent {
 /// since we *are* the compositor.
 pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCompositor) {
 	let serial = SERIAL_COUNTER.next_serial();
-	let time = state.clock.now().as_millis();
+	let time = InputTime::from_millis(state.clock.now().as_millis());
 
 	// specific pointer events (non-keyboard) should reset the cursor inactivity timer
 	match event {
@@ -214,7 +218,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 				&RelativeMotionEvent {
 					delta,
 					delta_unaccel: delta,
-					utime: time as u64,
+					time,
 				},
 			);
 
@@ -379,7 +383,7 @@ type ResolvedKey = (Keycode, Vec<Keycode>);
 /// per event, so a pasted string arrives as a sequence of `TypeText` events.
 /// Characters that the current layout cannot produce (e.g. Cyrillic on a US
 /// layout) are skipped with a warning.
-fn type_text(state: &mut MoonshineCompositor, text: &str, time: u32) {
+fn type_text(state: &mut MoonshineCompositor, text: &str, time: InputTime) {
 	let Some(keyboard) = state.seat.get_keyboard() else {
 		return;
 	};
@@ -414,7 +418,7 @@ fn inject_key(
 	keyboard: &KeyboardHandle<MoonshineCompositor>,
 	keycode: Keycode,
 	key_state: KeyState,
-	time: u32,
+	time: InputTime,
 ) {
 	keyboard.input::<(), _>(
 		state,
@@ -533,32 +537,42 @@ fn pen_tool_descriptor(tool_kind: u8) -> TabletToolDescriptor {
 	}
 }
 
-fn get_pen_tool(state: &mut MoonshineCompositor, tool_kind: u8) -> TabletToolHandle {
+fn get_pen_tool(state: &mut MoonshineCompositor, tool_kind: u8) -> TabletToolHandle<MoonshineCompositor> {
 	let tablet_seat = state.seat.tablet_seat();
 	let descriptor = pen_tool_descriptor(tool_kind);
 	if let Some(tool) = tablet_seat.get_tool(&descriptor) {
 		return tool;
 	}
 
-	let display_handle = state.display_handle.clone();
-	tablet_seat.add_tool::<MoonshineCompositor>(state, &display_handle, &descriptor)
+	tablet_seat.add_tool(&descriptor)
 }
 
-fn release_pen(state: &mut MoonshineCompositor, time: u32) {
+fn release_pen(state: &mut MoonshineCompositor, time: InputTime) {
 	let Some(tool_kind) = state.active_pen_tool_kind.take() else {
 		state.pen_buttons = 0;
 		return;
 	};
 
 	if let Some(tool) = state.seat.tablet_seat().get_tool(&pen_tool_descriptor(tool_kind)) {
-		tool.tip_up(time);
-		sync_pen_buttons(&tool, state.pen_buttons, 0, time);
-		tool.proximity_out(time);
+		// `proximity_out` internally releases any pressed buttons and lifts the tip.
+		tool.proximity_out(
+			state,
+			&ProximityOutEvent {
+				serial: SERIAL_COUNTER.next_serial(),
+				time,
+			},
+		);
 	}
 	state.pen_buttons = 0;
 }
 
-fn sync_pen_buttons(tool: &TabletToolHandle, old_buttons: u8, new_buttons: u8, time: u32) {
+fn sync_pen_buttons(
+	state: &mut MoonshineCompositor,
+	tool: &TabletToolHandle<MoonshineCompositor>,
+	old_buttons: u8,
+	new_buttons: u8,
+	time: InputTime,
+) {
 	const BUTTONS: [(u8, u32); 3] = [
 		(0x01, 0x14B), // BTN_STYLUS
 		(0x02, 0x14C), // BTN_STYLUS2
@@ -567,17 +581,30 @@ fn sync_pen_buttons(tool: &TabletToolHandle, old_buttons: u8, new_buttons: u8, t
 
 	for (mask, button) in BUTTONS {
 		if old_buttons & mask != new_buttons & mask {
-			let state = if new_buttons & mask != 0 {
+			let button_state = if new_buttons & mask != 0 {
 				ButtonState::Pressed
 			} else {
 				ButtonState::Released
 			};
-			tool.button(button, state, SERIAL_COUNTER.next_serial(), time);
+			tool.button(
+				state,
+				&TabletButtonEvent {
+					serial: SERIAL_COUNTER.next_serial(),
+					button,
+					state: button_state,
+					time,
+				},
+			);
 		}
 	}
 }
 
-fn process_pen_input(state: &mut MoonshineCompositor, event: PenInput, serial: smithay::utils::Serial, time: u32) {
+fn process_pen_input(
+	state: &mut MoonshineCompositor,
+	event: PenInput,
+	serial: smithay::utils::Serial,
+	time: InputTime,
+) {
 	if matches!(
 		event.event_kind,
 		POINTER_EVENT_CANCEL | POINTER_EVENT_HOVER_LEAVE | POINTER_EVENT_CANCEL_ALL
@@ -589,7 +616,7 @@ fn process_pen_input(state: &mut MoonshineCompositor, event: PenInput, serial: s
 	if event.event_kind == POINTER_EVENT_BUTTON_ONLY {
 		if let Some(tool_kind) = state.active_pen_tool_kind {
 			let tool = get_pen_tool(state, tool_kind);
-			sync_pen_buttons(&tool, state.pen_buttons, event.buttons, time);
+			sync_pen_buttons(state, &tool, state.pen_buttons, event.buttons, time);
 			state.pen_buttons = event.buttons;
 		}
 		return;
@@ -603,8 +630,7 @@ fn process_pen_input(state: &mut MoonshineCompositor, event: PenInput, serial: s
 	}
 
 	let tool = get_pen_tool(state, event.tool_kind);
-	let tablet_seat = state.seat.tablet_seat();
-	let Some(tablet) = tablet_seat.get_tablet(&state.pen_tablet_descriptor) else {
+	let Some(tablet) = state.seat.tablet_seat().get_tablet(&state.pen_tablet_descriptor) else {
 		return;
 	};
 	let location = normalized_pointer_location(state, event.x, event.y);
@@ -612,39 +638,65 @@ fn process_pen_input(state: &mut MoonshineCompositor, event: PenInput, serial: s
 	state.cursor_position = location;
 
 	if state.active_pen_tool_kind.is_none() {
-		let Some(focus) = focus.clone() else {
+		if focus.is_none() {
 			return;
-		};
-		tool.proximity_in(location, focus, &tablet, serial, time);
+		}
+		tool.proximity_in(
+			state,
+			focus.clone(),
+			tablet,
+			&ProximityInEvent {
+				location,
+				axis: None,
+				serial,
+				time,
+			},
+		);
 		state.active_pen_tool_kind = Some(event.tool_kind);
 	}
 
 	let value = event.pressure_or_distance.clamp(0.0, 1.0) as f64;
+	let mut axis = TabletAxisFrame::new();
 	if event.event_kind == POINTER_EVENT_HOVER {
-		tool.distance(value);
+		axis = axis.distance(value);
 	} else {
-		tool.pressure(value);
+		axis = axis.pressure(value);
 	}
 
 	if event.rotation != ROTATION_UNKNOWN && event.tilt != TILT_UNKNOWN {
 		let angle = (event.rotation as f64).to_radians();
 		let magnitude = f64::from(event.tilt.min(90));
-		tool.tilt((magnitude * angle.sin(), -magnitude * angle.cos()));
+		axis = axis.tilt(magnitude * angle.sin(), -magnitude * angle.cos());
 	}
+	tool.axis(state, axis);
 
-	tool.motion(location, focus, &tablet, serial, time);
-	sync_pen_buttons(&tool, state.pen_buttons, event.buttons, time);
+	tool.motion(state, focus, &TabletMotionEvent { location, serial, time });
+	sync_pen_buttons(state, &tool, state.pen_buttons, event.buttons, time);
 	state.pen_buttons = event.buttons;
 
 	match event.event_kind {
 		POINTER_EVENT_DOWN | POINTER_EVENT_MOVE => {
-			tool.tip_down(SERIAL_COUNTER.next_serial(), time);
+			tool.down(
+				state,
+				&TabletDownEvent {
+					serial: SERIAL_COUNTER.next_serial(),
+					time,
+				},
+			);
 		},
 		POINTER_EVENT_UP => {
-			tool.tip_up(time);
+			tool.up(
+				state,
+				&TabletUpEvent {
+					serial: SERIAL_COUNTER.next_serial(),
+					time,
+				},
+			);
 		},
 		_ => {},
 	}
+
+	tool.frame(state, time);
 }
 
 fn normalized_pointer_location(state: &MoonshineCompositor, x: f32, y: f32) -> Point<f64, Logical> {

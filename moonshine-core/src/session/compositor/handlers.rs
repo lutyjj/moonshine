@@ -5,13 +5,14 @@
 
 use smithay::backend::allocator::Buffer;
 use smithay::backend::allocator::dmabuf::Dmabuf;
-use smithay::backend::input::TabletToolDescriptor;
+use smithay::backend::input::{InputTime, TabletToolDescriptor};
 use smithay::backend::renderer::ImportDma;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::delegate_dispatch2;
 use smithay::desktop::Window;
 use smithay::input::dnd::DndGrabHandler;
 use smithay::input::pointer::{CursorImageStatus, MotionEvent, PointerHandle};
+use smithay::input::tablet::TabletSeatHandler;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgToplevelState;
@@ -25,12 +26,11 @@ use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState, is_sync_subsurface};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::output::OutputHandler;
-use smithay::wayland::pointer_constraints::{PointerConstraintsHandler, with_pointer_constraint};
+use smithay::wayland::pointer_constraints::{ConstraintRemove, PointerConstraintsHandler, with_pointer_constraint};
 use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::data_device::{DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler};
 use smithay::wayland::shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState};
 use smithay::wayland::shm::{ShmHandler, ShmState};
-use smithay::wayland::tablet_manager::TabletSeatHandler;
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
 use smithay::xwayland::xwm::{Reorder, ResizeEdge, XwmId};
 use smithay::xwayland::{X11Surface, X11Wm, XwmHandler};
@@ -1145,7 +1145,7 @@ impl MoonshineCompositor {
 						&MotionEvent {
 							location: self.cursor_position,
 							serial,
-							time: self.clock.now().as_millis(),
+							time: InputTime::from_millis(self.clock.now().as_millis()),
 						},
 					);
 					pointer.frame(self);
@@ -1175,7 +1175,7 @@ impl MoonshineCompositor {
 						&MotionEvent {
 							location: self.cursor_position,
 							serial,
-							time: self.clock.now().as_millis(),
+							time: InputTime::from_millis(self.clock.now().as_millis()),
 						},
 					);
 					pointer.frame(self);
@@ -1602,6 +1602,8 @@ impl SeatHandler for MoonshineCompositor {
 }
 
 impl TabletSeatHandler for MoonshineCompositor {
+	type ToolFocus = WlSurface;
+
 	fn tablet_tool_image(&mut self, _tool: &TabletToolDescriptor, image: CursorImageStatus) {
 		self.cursor_status = image;
 	}
@@ -1644,7 +1646,13 @@ impl PointerConstraintsHandler for MoonshineCompositor {
 		}
 	}
 
-	fn remove_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {}
+	fn remove_constraint(
+		&mut self,
+		_surface: &WlSurface,
+		_pointer: &PointerHandle<Self>,
+		_constraint: ConstraintRemove,
+	) {
+	}
 
 	fn cursor_position_hint(
 		&mut self,
@@ -1797,7 +1805,7 @@ impl XWaylandShellHandler for MoonshineCompositor {
 					&MotionEvent {
 						location: self.cursor_position,
 						serial,
-						time: self.clock.now().as_millis(),
+						time: InputTime::from_millis(self.clock.now().as_millis()),
 					},
 				);
 				pointer.frame(self);

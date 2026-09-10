@@ -25,9 +25,11 @@ use smithay::desktop::utils::send_frames_surface_tree;
 use smithay::desktop::utils::{OutputPresentationFeedback, take_presentation_feedback_surface_tree};
 use std::collections::HashMap;
 
+use smithay::backend::input::InputTime;
 use smithay::desktop::Space;
 use smithay::input::keyboard::XkbConfig;
 use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
+use smithay::input::tablet::{TabletDescriptor, TabletSeatTrait};
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
 use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
@@ -46,7 +48,7 @@ use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
-use smithay::wayland::tablet_manager::{TabletDescriptor, TabletManagerState, TabletSeatTrait};
+use smithay::wayland::tablet_manager::TabletManagerState;
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::X11Wm;
 
@@ -488,8 +490,7 @@ impl MoonshineCompositor {
 			usb_id: None,
 			syspath: None,
 		};
-		seat.tablet_seat()
-			.add_tablet::<Self>(&display_handle, &pen_tablet_descriptor);
+		seat.tablet_seat().add_tablet(&pen_tablet_descriptor);
 
 		// Create the Wayland socket for clients to connect.
 		let socket_source = ListeningSocketSource::new_auto().expect("Failed to create Wayland listening socket");
@@ -1608,7 +1609,7 @@ impl MoonshineCompositor {
 				&smithay::input::pointer::MotionEvent {
 					location: self.cursor_position,
 					serial,
-					time: self.clock.now().as_millis(),
+					time: InputTime::from_millis(self.clock.now().as_millis()),
 				},
 			);
 			pointer.frame(self);
@@ -1657,6 +1658,7 @@ impl MoonshineCompositor {
 			std::env::var("MOONSHINE_WAYLAND_DEBUG")
 				.ok()
 				.map(|_| ("WAYLAND_DEBUG", "1")),
+			std::iter::empty::<&str>(),
 			true,
 			xwayland_log_stdout,
 			xwayland_log_stderr,
