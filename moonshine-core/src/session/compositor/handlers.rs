@@ -1816,16 +1816,15 @@ impl XwmHandler for MoonshineCompositor {
 	fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: smithay::xwayland::xwm::WmWindowProperty) {
 		// STEAM_OVERLAY (forwarded as Other) drives overlay z-order: mark it
 		// dirty so update_overlay_z_order runs this frame instead of polling.
-		if let smithay::xwayland::xwm::WmWindowProperty::Other(atom) = property {
-			if self
+		if let smithay::xwayland::xwm::WmWindowProperty::Other(atom) = property
+			&& self
 				.x11_focus
 				.as_ref()
 				.is_some_and(|xf| xf.steam_overlay_atom() as u32 == atom)
-			{
-				self.overlay_dirty = true;
-				self.screen_dirty = true;
-				return;
-			}
+		{
+			self.overlay_dirty = true;
+			self.screen_dirty = true;
+			return;
 		}
 
 		// Only re-evaluate focus for properties that affect focus ranking.
