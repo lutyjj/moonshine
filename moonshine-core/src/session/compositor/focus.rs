@@ -297,9 +297,7 @@ pub(crate) struct FocusState {
 	/// X11 window ID that most recently sent `_NET_ACTIVE_WINDOW`.
 	/// Cleared after being consumed by `pick_best_candidate`.
 	requested_focus_window: Option<u32>,
-	/// Wayland surface that most recently requested activation via
-	/// `xdg-activation` (the Wayland analog of `_NET_ACTIVE_WINDOW`).
-	/// Cleared after being consumed by `pick_best_candidate`.
+	/// Wayland surface that requested activation via `xdg-activation`.
 	requested_focus_surface: Option<WlSurface>,
 }
 

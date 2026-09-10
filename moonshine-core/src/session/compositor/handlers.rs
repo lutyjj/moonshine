@@ -386,11 +386,8 @@ impl CompositorHandler for MoonshineCompositor {
 			return;
 		}
 
-		// Re-evaluate focus when a window presents its first buffer. The
-		// focus-ready gate in `build_candidates` holds focus on the Steam UI
-		// until the game presents; without this trigger a game that maps
-		// bufferless stays excluded from the candidates forever, so its
-		// keyboard focus never moves and keyboard input goes nowhere.
+		// Re-evaluate focus when a window presents its first buffer, or the
+		// focus-ready gate would exclude it forever (keyboard goes nowhere).
 		if !had_buffer
 			&& smithay::backend::renderer::utils::with_renderer_surface_state(surface, |st| st.buffer().is_some())
 				.unwrap_or(false)
@@ -813,11 +810,7 @@ impl MoonshineCompositor {
 		}
 	}
 
-	/// Whether a window currently has a committed buffer to present.
-	///
-	/// Checks the window's own surface (Wayland-native or X11/XWayland) and
-	/// the WSI override surface, which games present their Vulkan frames
-	/// through instead of their window surface.
+	/// Whether a window has a committed buffer (own surface or WSI override).
 	fn window_has_buffer(&self, window: &Window) -> bool {
 		let surface_has_buffer = |s: &WlSurface| {
 			smithay::backend::renderer::utils::with_renderer_surface_state(s, |st| st.buffer().is_some())
@@ -832,10 +825,7 @@ impl MoonshineCompositor {
 			.is_some_and(|(s, oxid)| Some(*oxid) == x11_id && s.is_alive() && surface_has_buffer(s))
 	}
 
-	/// Whether an explicit focus request for `requested` should be deferred
-	/// because the current focus is the Steam UI and `requested` is not
-	/// presenting yet — the BPM launch UI keeps focus until the game presents.
-	/// Once `requested` presents a buffer, the request is honored.
+	/// Defer to the Steam UI only while `requested` hasn't presented yet.
 	fn defer_focus_to_steam_ui(&self, requested: &Window) -> bool {
 		let current_is_steam_ui = self
 			.focused_x11_window
@@ -959,14 +949,8 @@ impl MoonshineCompositor {
 			);
 		}
 
-		// Honor any pending `xdg-activation` focus request — the Wayland analog
-		// of `_NET_ACTIVE_WINDOW`. Wayland-native games (e.g. Proton with
-		// PROTON_ENABLE_WAYLAND=1) cannot send the X11 message, so this is their
-		// only way to request focus. Unlike `_NET_ACTIVE_WINDOW` (which Wine
-		// re-sends), `xdg-activation` is a one-shot event, so the request stays
-		// sticky until the window is gone — otherwise the next (unrelated)
-		// focus re-evaluation would revert focus to the Steam UI via Steam's
-		// focus-control ordering, which never reorders under Moonshine.
+		// Honor the pending `xdg-activation` request (Wayland's
+		// `_NET_ACTIVE_WINDOW`); it's one-shot, so keep it sticky.
 		if let Some(requested_surface) = self.focus_state.peek_requested_focus_surface().cloned() {
 			if let Some(w) = candidates
 				.iter()

@@ -848,13 +848,12 @@ impl MoonshineCompositor {
 		// deliver frame callbacks to it. Otherwise scanout from the lone
 		// space toplevel as before.
 		//
-		// Direct scanout bypasses the GLES compositor entirely, so the
-		// cursor cannot be blended onto the frame.  Skip direct scanout
-		// when the cursor is visible so that the GLES path composites the
-		// cursor on top.
-		let cursor_visible = self
+		// Direct scanout bypasses GLES, so skip it while an actually-drawn
+		// cursor (not client-hidden) needs compositing.
+		let pointer_active = self
 			.last_pointer_activity
 			.is_some_and(|t| t.elapsed() <= std::time::Duration::from_secs(3));
+		let cursor_visible = pointer_active && !matches!(self.cursor_status, CursorImageStatus::Hidden);
 		// While a Steam overlay is raised we must composite it together with the
 		// game (gamescope's `paint_all`), so direct scanout — which bypasses the
 		// space — is disabled.
