@@ -674,7 +674,7 @@ impl VideoPipelineInner {
 		};
 
 		// Color converter will be initialized on first frame.
-		let mut color_converter: Option<ColorConverter> = None;
+		let mut color_converters: std::collections::HashMap<u32, ColorConverter> = std::collections::HashMap::new();
 
 		// Encoding loop - receives frames from compositor.
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.fps as f64);
@@ -922,24 +922,11 @@ impl VideoPipelineInner {
 
 				let t2_imported = std::time::Instant::now();
 
-				// Recreate the converter if the input format changed (e.g. GBM pool
-				// ABGR2101010 → direct scanout XBGR8888). The converter's image view
-				// format must match the source image format.
-				if let Some(ref conv) = color_converter
-					&& conv.config().input_format != frame_input_format
-				{
-					tracing::info!(
-						"Input format changed from {:?} to {:?}, recreating color converter",
-						conv.config().input_format,
-						frame_input_format,
-					);
-					color_converter = None;
-				}
-
-				// Initialize converter if needed.
-				let converter = match &mut color_converter {
-					Some(conv) => conv,
-					None => {
+				// Get (or build) a converter for this input format. Cached per
+				// format so switching render paths doesn't rebuild one each frame.
+				let converter = match color_converters.entry(frame.format) {
+					std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+					std::collections::hash_map::Entry::Vacant(e) => {
 						let (color_space, full_range) = match ctx.dynamic_range {
 							VideoDynamicRange::Sdr => (ColorSpace::Bt709, ctx.full_range),
 							VideoDynamicRange::Hdr => (ColorSpace::Bt2020, ctx.full_range),
@@ -950,8 +937,8 @@ impl VideoPipelineInner {
 						config.full_range = full_range;
 						match ColorConverter::new(context.clone(), config) {
 							Ok(conv) => {
-								color_converter = Some(conv);
-								color_converter.as_mut().unwrap()
+								tracing::debug!("Created color converter for input format {frame_input_format:?}");
+								e.insert(conv)
 							},
 							Err(e) => {
 								tracing::warn!("Failed to create color converter: {e}");
