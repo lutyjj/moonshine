@@ -223,6 +223,9 @@ pub(crate) struct MoonshineCompositor {
 
 	// -- Input --
 	pub seat: Seat<Self>,
+	/// Clipboard text queued by `TypeText` events, typed in bounded batches on
+	/// successive frame ticks. See [`crate::session::compositor::input`].
+	pub pending_text: String,
 
 	// -- Cursor --
 	pub cursor_position: Point<f64, Logical>,
@@ -597,6 +600,7 @@ impl MoonshineCompositor {
 				dmabuf_global,
 				frame_tx,
 				seat,
+				pending_text: String::new(),
 				cursor_position: Point::from((width as f64 / 2.0, height as f64 / 2.0)),
 				cursor_status: CursorImageStatus::default_named(),
 				pointer_element,
