@@ -823,9 +823,7 @@ impl MoonshineCompositor {
 		self.override_surface
 			.as_ref()
 			.is_some_and(|(s, focus_key, render_window)| {
-				(Some(*focus_key) == x11_id || Some(*render_window) == x11_id)
-					&& s.is_alive()
-					&& surface_has_buffer(s)
+				(Some(*focus_key) == x11_id || Some(*render_window) == x11_id) && s.is_alive() && surface_has_buffer(s)
 			})
 	}
 
