@@ -395,7 +395,7 @@ impl CompositorHandler for MoonshineCompositor {
 				.space
 				.elements()
 				.any(|w| w.wl_surface().is_some_and(|s| &*s == surface))
-				|| self.override_surface.as_ref().is_some_and(|(s, _)| s == surface))
+				|| self.override_surface.as_ref().is_some_and(|(s, _, _)| s == surface))
 		{
 			self.reevaluate_focus();
 		}
@@ -822,7 +822,11 @@ impl MoonshineCompositor {
 		let x11_id = window.x11_surface().map(|x| x.window_id());
 		self.override_surface
 			.as_ref()
-			.is_some_and(|(s, oxid)| Some(*oxid) == x11_id && s.is_alive() && surface_has_buffer(s))
+			.is_some_and(|(s, focus_key, render_window)| {
+				(Some(*focus_key) == x11_id || Some(*render_window) == x11_id)
+					&& s.is_alive()
+					&& surface_has_buffer(s)
+			})
 	}
 
 	/// Defer to the Steam UI only while `requested` hasn't presented yet.

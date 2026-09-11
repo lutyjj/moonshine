@@ -320,7 +320,9 @@ pub(crate) struct MoonshineCompositor {
 	/// Override surface from gamescope_swapchain.
 	/// When set, this surface is rendered instead of the original X11 window.
 	/// The u32 is the associated X11 window ID (0 for native Wayland).
-	pub override_surface: Option<(WlSurface, u32)>,
+	/// WSI override surface `(surface, focus_key, render_window)` — focus_key may
+	/// be the Steam UI while render_window is the game that actually presents.
+	pub override_surface: Option<(WlSurface, u32, u32)>,
 
 	/// X11 window ID of the currently focused window (from Smithay's keyboard focus).
 	/// Used by the WSI layer to match override surfaces to focused windows.
@@ -987,7 +989,7 @@ impl MoonshineCompositor {
 		// the currently focused window (or is 0 with no X11 focus).
 		if override_active {
 			let (override_surface, override_xid) = match self.override_surface.as_ref() {
-				Some(v) => (v.0.clone(), v.1),
+				Some(v) => (v.0.clone(), v.2),
 				None => {
 					tracing::warn!("override_active but override_surface is None");
 					return;
@@ -1021,7 +1023,7 @@ impl MoonshineCompositor {
 
 			elements.extend(override_elements.into_iter().map(OutputRenderElements::Space));
 		} else {
-			if self.override_surface.as_ref().is_some_and(|(s, _)| !s.alive()) {
+			if self.override_surface.as_ref().is_some_and(|(s, _, _)| !s.alive()) {
 				tracing::debug!("Override surface is dead, clearing.");
 				self.override_surface = None;
 			}
@@ -1113,7 +1115,7 @@ impl MoonshineCompositor {
 		// Also send frame callbacks to the override surface if active,
 		// so the NVIDIA driver's Wayland WSI unblocks and presents the
 		// next frame.
-		if let Some((ref override_surface, _)) = self.override_surface
+		if let Some((ref override_surface, _, _)) = self.override_surface
 			&& override_surface.alive()
 		{
 			send_frames_surface_tree(
@@ -1340,7 +1342,7 @@ impl MoonshineCompositor {
 	/// the WSI layer's `vkQueuePresentKHR` can unblock for the next frame.
 	fn try_direct_scanout_override(&mut self) -> bool {
 		let override_surface = match self.override_surface.as_ref() {
-			Some((s, _)) if s.alive() => s.clone(),
+			Some((s, _, _)) if s.alive() => s.clone(),
 			_ => return false,
 		};
 
@@ -1515,7 +1517,7 @@ impl MoonshineCompositor {
 		// a new wl_surface) when toggling HDR mode, so the old surface's
 		// gamescope_current entry must be evicted explicitly — it won't be
 		// cleaned up by create_swapchain (which only sees the new surface).
-		if let Some(old_surface) = self.override_surface.as_ref().map(|(s, _)| s.clone())
+		if let Some(old_surface) = self.override_surface.as_ref().map(|(s, _, _)| s.clone())
 			&& old_surface != surface
 			&& let Some(cm) = &mut self.color_management
 		{
@@ -1523,19 +1525,21 @@ impl MoonshineCompositor {
 		}
 
 		tracing::debug!(x11_window, focus_key, "Storing override surface for X11 window");
-		self.override_surface = Some((surface, focus_key));
+		self.override_surface = Some((surface, focus_key, x11_window));
 	}
 
 	/// Returns `true` when the WSI layer has an active override surface
 	/// for the currently focused window.
 	pub fn is_override_active(&self) -> bool {
-		self.override_surface.as_ref().is_some_and(|(s, x11_win)| {
-			s.alive()
-				&& match *x11_win {
-					0 => self.focused_x11_window.is_none(),
-					id => self.focused_x11_window == Some(id),
-				}
-		})
+		self.override_surface
+			.as_ref()
+			.is_some_and(|(s, focus_key, render_window)| {
+				s.alive()
+					&& [*focus_key, *render_window].iter().any(|key| match *key {
+						0 => self.focused_x11_window.is_none(),
+						id => self.focused_x11_window == Some(id),
+					})
+			})
 	}
 
 	/// Clear all dropdown/override windows.

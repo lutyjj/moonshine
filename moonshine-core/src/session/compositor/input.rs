@@ -837,7 +837,7 @@ fn find_surface_at(
 			// Native Wayland path (x11_win == 0): the override surface is a
 			// fullscreen bypass surface at the output origin.  Route pointer
 			// events directly to it so the application receives input.
-			if let Some((ref override_surface, _)) = state.override_surface {
+			if let Some((ref override_surface, _, _)) = state.override_surface {
 				return Some((override_surface.clone(), Point::from((0.0, 0.0))));
 			}
 		}
