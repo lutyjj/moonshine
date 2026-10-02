@@ -82,7 +82,7 @@ pub(crate) struct DmaBufPlane {
 /// reused when all of these match the new request; a mismatch on the same fd
 /// means the fd number was recycled for a different buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ImportParams {
+pub(super) struct ImportParams {
 	width: u32,
 	height: u32,
 	format: vk::Format,
@@ -93,7 +93,7 @@ struct ImportParams {
 }
 
 impl ImportParams {
-	fn new(width: u32, height: u32, format: vk::Format, planes: &[DmaBufPlane]) -> Self {
+	pub(super) fn new(width: u32, height: u32, format: vk::Format, planes: &[DmaBufPlane]) -> Self {
 		let mut plane_layouts = [(0, 0); 4];
 		for (i, p) in planes.iter().take(4).enumerate() {
 			plane_layouts[i] = (p.offset, p.stride);
@@ -240,6 +240,12 @@ impl Identity {
 			Self::Inode(id) => BufferId::of(fd).is_ok_and(|other| other == id),
 		}
 	}
+}
+
+/// Check whether `a` and `b` refer to the same DMA-BUF, with the method the
+/// import cache uses. An error counts as different buffers.
+pub(super) fn same_buffer(a: BorrowedFd<'_>, b: BorrowedFd<'_>) -> bool {
+	Identity::read(KcmpProbe::get().method(), a).is_ok_and(|identity| identity.matches(a, b))
 }
 
 impl CachedImport {

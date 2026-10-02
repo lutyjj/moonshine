@@ -119,13 +119,17 @@ rustPlatform.buildRustPackage {
   pname = "moonshine";
   inherit version src;
 
-  # No vendor hash to maintain: crates.io checksums come straight from
-  # Cargo.lock, and git dependencies are fetched at eval time by the rev the
-  # lockfile pins (allowBuiltinFetchGit), so the lockfile the maintainers
-  # already keep up to date is the single source of truth.
+  # crates.io checksums come straight from Cargo.lock, and git dependencies
+  # are fetched at eval time by the rev the lockfile pins
+  # (allowBuiltinFetchGit), so the lockfile is the source of truth. The one
+  # exception is pyrowave-rs: Granite, one of its submodules, pins revisions
+  # of its own submodules that no branch reaches, which the builtin fetch
+  # cannot fetch. fetchgit fetches it by revision with this hash; bump the
+  # hash with the pyrowave-rs pin.
   cargoLock = {
     lockFile = ../Cargo.lock;
     allowBuiltinFetchGit = true;
+    outputHashes."pyrowave-0.1.0" = "sha256-tDJCEn/nMptTewHsCLzMMdKuhMoVkg7eUChKtVUl6p0=";
   };
 
   # The inputtino graft described above. The cargo setup hook has already

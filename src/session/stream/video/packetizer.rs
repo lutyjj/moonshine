@@ -159,6 +159,16 @@ impl Packetizer {
 		}
 	}
 
+	/// Four blocks of 1023 data shards fit without parity. Reserve the short
+	/// frame header from that capacity.
+	pub fn frame_capacity(requested_packet_size: usize) -> Option<usize> {
+		let payload = requested_packet_size.checked_sub(NV_VIDEO_PACKET_SIZE)?;
+		if !(1..=u16::MAX as usize).contains(&payload) {
+			return None;
+		}
+		Some(MAX_FEC_BLOCKS * MAX_DATA_SHARDS_PER_BLOCK * payload - VIDEO_FRAME_HEADER_SIZE)
+	}
+
 	/// Update the cipher if the encryption key has rotated.
 	/// Called eagerly at the start of each `packetize()` call.
 	fn maybe_update_cipher(&mut self) {
@@ -208,6 +218,7 @@ impl Packetizer {
 		&mut self,
 		encoded_data: &[u8],
 		is_key_frame: bool,
+		first_packet_extra_flags: u8,
 		requested_packet_size: usize,
 		minimum_fec_packets: u32,
 		fec_percentage: u8,
@@ -216,6 +227,8 @@ impl Packetizer {
 		rtp_timestamp: u32,
 		frame_processing_latency: u16,
 	) -> Result<ShardBatch, ()> {
+		Self::frame_capacity(requested_packet_size).ok_or(())?;
+
 		// Eagerly read current encryption key and update cipher if rotated.
 		self.maybe_update_cipher();
 
@@ -352,6 +365,10 @@ impl Packetizer {
 					((block_index as u8) << 4) | last_block_index,
 					(block_shard_index << 12 | nr_data_shards << 22 | fec_percentage << 4) as u32,
 				);
+
+				if data_shard_index == 0 {
+					shard[NV_PACKET_OFFSET + 9] = first_packet_extra_flags;
+				}
 
 				// Copy payload from [header ++ encoded_data].
 				copy_header_and_data(
@@ -548,7 +565,7 @@ mod fec_tests {
 				data.truncate(data.len() - tail);
 				for encrypted in [false, true] {
 					let batch = packetizer(encrypted)
-						.packetize(&data, true, 80, 2, 20, 1, &mut 0, 0, 0)
+						.packetize(&data, true, 0, 80, 2, 20, 1, &mut 0, 0, 0)
 						.unwrap();
 					let received = reassemble(&batch, encrypted);
 					assert_eq!(received.len(), data.len(), "{shards} data packets, tail {tail}");
@@ -563,7 +580,7 @@ mod fec_tests {
 		let mut sequence = 77;
 		assert!(
 			packetizer(false)
-				.packetize(&frame(4093), true, 80, 2, 20, 1, &mut sequence, 0, 0)
+				.packetize(&frame(4093), true, 0, 80, 2, 20, 1, &mut sequence, 0, 0)
 				.is_err()
 		);
 		assert_eq!(sequence, 77);
@@ -582,7 +599,7 @@ mod fec_tests {
 			(600, 100, 2),
 		] {
 			let batch = packetizer(false)
-				.packetize(&frame(data_shards), true, 80, minimum, percentage, 1, &mut 0, 0, 0)
+				.packetize(&frame(data_shards), true, 0, 80, minimum, percentage, 1, &mut 0, 0, 0)
 				.unwrap();
 			let mut blocks = BTreeMap::<u8, Vec<Vec<u8>>>::new();
 			for packet in batch.as_bytes().chunks_exact(batch.shard_size()) {
@@ -612,6 +629,96 @@ mod fec_tests {
 					.unwrap();
 				assert_eq!(&received[0].as_ref().unwrap()[PAYLOAD_OFFSET..], expected);
 			}
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn packetizer(encrypted: bool) -> Packetizer {
+		let (_, keys) = tokio::sync::watch::channel(crate::session::SessionKeyData {
+			remote_input_key: vec![0x42; 16],
+			remote_input_key_id: 1,
+		});
+		Packetizer::new(encrypted, keys)
+	}
+
+	fn reassemble(batch: &ShardBatch, encrypted: bool, first_flags: u8) -> Vec<u8> {
+		let cipher = Aes128Gcm::new_from_slice(&[0x42; 16]).unwrap();
+		let mut bytes = Vec::new();
+		let mut last_payload_len = 0;
+		let mut data_packets = 0;
+		for wire in batch.as_bytes().chunks_exact(batch.shard_size()) {
+			let packet = if encrypted {
+				let mut data = wire[32..].to_vec();
+				cipher
+					.decrypt_in_place_detached(
+						Nonce::from_slice(&wire[..12]),
+						b"",
+						&mut data,
+						aes_gcm::Tag::from_slice(&wire[16..32]),
+					)
+					.unwrap();
+				data
+			} else {
+				wire.to_vec()
+			};
+			let fec = u32::from_le_bytes(packet[28..32].try_into().unwrap());
+			let index = (fec >> 12) & 0x3ff;
+			let data_count = fec >> 22;
+			if index >= data_count {
+				continue;
+			}
+			assert_eq!(packet[25], if data_packets == 0 { first_flags } else { 0 });
+			if data_packets == 0 {
+				assert_eq!(packet[32], 1);
+				assert_eq!(packet[35], 2);
+				assert_eq!(&packet[38..40], &[0, 0]);
+				last_payload_len = u16::from_le_bytes(packet[36..38].try_into().unwrap()) as usize;
+			}
+			bytes.extend_from_slice(&packet[32..]);
+			data_packets += 1;
+		}
+		let payload = batch.shard_size() - if encrypted { 64 } else { 32 };
+		bytes.truncate((data_packets - 1) * payload + last_payload_len);
+		bytes.drain(..8);
+		bytes
+	}
+
+	#[test]
+	fn frames_preserve_data_across_blocks() {
+		let data: Vec<u8> = (0..20_004).map(|i| (i % 251) as u8).collect();
+		for encrypted in [false, true] {
+			for first_flags in [0, 0x80] {
+				let batch = packetizer(encrypted)
+					.packetize(&data, true, first_flags, 80, 2, 20, 7, &mut 0, 3000, 10)
+					.unwrap();
+				assert!(batch.shard_count() > 255, "exercise multiple FEC blocks");
+				assert_eq!(reassemble(&batch, encrypted, first_flags), data);
+			}
+		}
+	}
+
+	#[test]
+	fn frame_capacity_matches_four_blocks() {
+		// Four unprotected blocks hold 1023 data shards each.
+		// Each payload here is 64 bytes.
+		let capacity = 261_880;
+		assert_eq!(Packetizer::frame_capacity(80), Some(capacity));
+		let data = vec![0x5a; capacity];
+		let mut packetizer = packetizer(false);
+		let batch = packetizer
+			.packetize(&data, true, 0x80, 80, 0, 20, 1, &mut 0, 0, 0)
+			.unwrap();
+		assert_eq!(reassemble(&batch, false, 0x80), data);
+		for size in [0, 1, 15, 16, 65552, usize::MAX] {
+			assert!(
+				packetizer
+					.packetize(&[0; 8], true, 0x80, size, 0, 20, 1, &mut 0, 0, 0)
+					.is_err()
+			);
 		}
 	}
 }
