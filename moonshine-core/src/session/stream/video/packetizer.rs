@@ -31,6 +31,9 @@ enum RtpFlag {
 	StartOfFrame = 0x4,
 }
 
+const FRAME_TYPE_KEY: u8 = 2;
+const FRAME_TYPE_PREDICTED: u8 = 1;
+
 #[derive(Debug)]
 #[repr(C)]
 struct VideoFrameHeader {
@@ -51,6 +54,55 @@ impl VideoFrameHeader {
 	}
 }
 
+/// One FEC block: data shards `[start, end)` plus `parity` parity shards.
+/// Clients derive the parity count as `ceil(data * fec_percentage / 100)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockPlan {
+	start: usize,
+	end: usize,
+	parity: usize,
+	fec_percentage: usize,
+}
+
+fn plan_coded_blocks(nr_data_shards: usize, fec_percentage: u8, minimum_fec_packets: u32) -> Vec<BlockPlan> {
+	let nr_parity_shards_per_block = MAX_SHARDS * fec_percentage as usize / (100 + fec_percentage as usize);
+	let nr_data_shards_per_block = MAX_SHARDS - nr_parity_shards_per_block;
+
+	// Subtract one so that e.g. 100 data shards at 100 per block is one block, not two.
+	let nr_blocks = (nr_data_shards - 1) / nr_data_shards_per_block + 1;
+	tracing::trace!(
+		"Sending a max of {nr_data_shards_per_block} data shards and {nr_parity_shards_per_block} parity shards per block."
+	);
+	tracing::trace!("Sending {nr_blocks} blocks of video data.");
+	if nr_blocks > 4 {
+		tracing::debug!(
+			"Trying to create {nr_blocks} blocks, but we are limited to 4 blocks so we are sending all remaining packets without FEC."
+		);
+	}
+
+	(0..nr_blocks.min(4))
+		.map(|block_index| {
+			let start = block_index * nr_data_shards_per_block;
+			let end = if block_index == 3 {
+				nr_data_shards
+			} else {
+				((block_index + 1) * nr_data_shards_per_block).min(nr_data_shards)
+			};
+			let data = end - start;
+			let parity = (data * fec_percentage as usize / 100)
+				.max(minimum_fec_packets as usize)
+				.min(MAX_SHARDS.saturating_sub(data));
+			// Recompute the percentage for rounding and for blocks without parity.
+			BlockPlan {
+				start,
+				end,
+				parity,
+				fec_percentage: parity * 100 / data,
+			}
+		})
+		.collect()
+}
+
 /// Write an RTP header directly into a byte slice at offset 0.
 fn write_rtp_header(buf: &mut [u8], sequence_number: u16, timestamp: u32) {
 	buf[0] = 0x90;
@@ -66,13 +118,14 @@ fn write_nv_video_packet(
 	stream_packet_index: u32,
 	frame_index: u32,
 	flags: u8,
+	extra_flags: u8,
 	multi_fec_blocks: u8,
 	fec_info: u32,
 ) {
 	buf[0..4].copy_from_slice(&stream_packet_index.to_le_bytes());
 	buf[4..8].copy_from_slice(&frame_index.to_le_bytes());
 	buf[8] = flags;
-	buf[9] = 0; // reserved
+	buf[9] = extra_flags;
 	buf[10] = 0x10; // multi_fec_flags
 	buf[11] = multi_fec_blocks;
 	buf[12..16].copy_from_slice(&fec_info.to_le_bytes());
@@ -105,6 +158,33 @@ fn copy_header_and_data(
 		let data_end = end - VIDEO_FRAME_HEADER_SIZE;
 		let n = data_end - data_start;
 		dst[written..written + n].copy_from_slice(&encoded_data[data_start..data_end]);
+	}
+}
+
+struct FrameLayout<'a> {
+	data: &'a [u8],
+	payload_size: usize,
+	nr_data_shards: usize,
+	last_payload_len: u16,
+}
+
+impl<'a> FrameLayout<'a> {
+	fn new(data: &'a [u8], requested_packet_size: usize) -> Result<Self, ()> {
+		let payload_size = requested_packet_size
+			.checked_sub(NV_VIDEO_PACKET_SIZE)
+			.filter(|size| (1..=u16::MAX as usize).contains(size))
+			.ok_or(())?;
+		let packet_data_len = VIDEO_FRAME_HEADER_SIZE + data.len();
+		let last_payload_len = match packet_data_len % payload_size {
+			0 => payload_size,
+			len => len,
+		};
+		Ok(Self {
+			data,
+			payload_size,
+			nr_data_shards: packet_data_len.div_ceil(payload_size),
+			last_payload_len: last_payload_len as u16,
+		})
 	}
 }
 
@@ -206,60 +286,62 @@ impl Packetizer {
 		rtp_timestamp: u32,
 		frame_processing_latency: u16,
 	) -> Result<ShardBatch, ()> {
-		Self::frame_capacity(requested_packet_size, fec_percentage).ok_or(())?;
+		let frame = FrameLayout::new(encoded_data, requested_packet_size)?;
+		let plan = plan_coded_blocks(frame.nr_data_shards, fec_percentage, minimum_fec_packets);
+		let header = VideoFrameHeader {
+			header_type: 0x01,
+			frame_processing_latency,
+			frame_type: if is_key_frame {
+				FRAME_TYPE_KEY
+			} else {
+				FRAME_TYPE_PREDICTED
+			},
+			last_payload_len: frame.last_payload_len.into(),
+		};
+		self.emit(
+			&frame,
+			&header,
+			&plan,
+			first_packet_extra_flags,
+			frame_number,
+			sequence_number,
+			rtp_timestamp,
+		)
+	}
 
+	/// Write the frame's data shards per `plan`, compute each block's parity,
+	/// and encrypt.
+	#[allow(clippy::too_many_arguments)]
+	fn emit(
+		&mut self,
+		frame: &FrameLayout,
+		header: &VideoFrameHeader,
+		plan: &[BlockPlan],
+		first_packet_extra_flags: u8,
+		frame_number: u32,
+		sequence_number: &mut u32,
+		rtp_timestamp: u32,
+	) -> Result<ShardBatch, ()> {
 		// Eagerly read current encryption key and update cipher if rotated.
 		self.maybe_update_cipher();
 
 		tracing::trace!(
-			"Packetizing frame {}, size={}, keyframe={}",
-			frame_number,
-			encoded_data.len(),
-			is_key_frame
+			"Packetizing frame {frame_number}, size={}, keyframe={}, blocks={}",
+			frame.data.len(),
+			header.frame_type == FRAME_TYPE_KEY,
+			plan.len()
 		);
-
-		let requested_shard_payload_size = requested_packet_size - NV_VIDEO_PACKET_SIZE;
-		let packet_data_len = VIDEO_FRAME_HEADER_SIZE + encoded_data.len();
-		let last_shard_size = packet_data_len % requested_shard_payload_size;
-		let last_shard_size = if last_shard_size == 0 {
-			requested_shard_payload_size
-		} else {
-			last_shard_size
-		};
-
-		let video_frame_header = VideoFrameHeader {
-			header_type: 0x01,
-			frame_processing_latency,
-			frame_type: if is_key_frame { 2 } else { 1 },
-			last_payload_len: last_shard_size as u32,
-		};
 
 		let mut header_bytes = [0u8; VIDEO_FRAME_HEADER_SIZE];
-		video_frame_header.serialize(&mut header_bytes);
+		header.serialize(&mut header_bytes);
 
-		// The total size of a shard (RTP + padding + NvVideoPacket + payload).
-		let requested_shard_size = PAYLOAD_OFFSET + requested_shard_payload_size;
-
+		let payload_size = frame.payload_size;
+		let packet_data_len = VIDEO_FRAME_HEADER_SIZE + frame.data.len();
+		let shard_size = PAYLOAD_OFFSET + payload_size;
 		// When encryption is enabled, reserve space for the per-shard prefix.
 		let prefix_size = if self.cipher.is_some() { ENC_PREFIX_SIZE } else { 0 };
-
-		let nr_data_shards = packet_data_len.div_ceil(requested_shard_payload_size);
-		assert!(nr_data_shards != 0);
-
-		let nr_parity_shards_per_block = MAX_SHARDS * fec_percentage as usize / (100 + fec_percentage as usize);
-		let nr_data_shards_per_block = MAX_SHARDS - nr_parity_shards_per_block;
-
-		// We need to subtract number of data shards by 1, otherwise you can get a situation where
-		// there are for example 100 data shards allowed per block and also 100 data shards available.
-		// In this case, nr_blocks = 100 / 100 + 1 = 2, but we only need to send 1 block.
-		// Subtracting the value of nr_data_shards by 1 avoids this situation.
-		let nr_blocks = (nr_data_shards - 1) / nr_data_shards_per_block + 1;
-		let last_block_index = (nr_blocks.min(4) as u8 - 1) << 6; // TODO: Why the bit shift? To 'force' a limit of 4 blocks?
-
-		tracing::trace!(
-			"Sending a max of {nr_data_shards_per_block} data shards and {nr_parity_shards_per_block} parity shards per block."
-		);
-		tracing::trace!("Sending {nr_blocks} blocks of video data.");
+		// The wire stores the last block index in bits 6-7, the current index in 4-5.
+		let last_block_index = ((plan.len() - 1) as u8) << 6;
 
 		// Accumulate all blocks into a single batch.
 		let mut all_shards = ShardBatch::empty();
@@ -271,23 +353,12 @@ impl Packetizer {
 		let mut total_fec_headers_us = 0u128;
 		let mut total_extend_us = 0u128;
 
-		for block_index in 0..nr_blocks {
-			let start = block_index * nr_data_shards_per_block;
-			let mut end = ((block_index + 1) * nr_data_shards_per_block).min(nr_data_shards);
-
-			if block_index == 3 {
-				tracing::debug!(
-					"Trying to create {nr_blocks} blocks, but we are limited to 4 blocks so we are sending all remaining packets without FEC."
-				);
-				end = nr_data_shards;
-			}
-
-			let nr_data_shards = end - start;
+		for (block_index, block) in plan.iter().enumerate() {
+			let nr_data_shards = block.end - block.start;
 			assert!(nr_data_shards != 0);
-
-			let nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
-				.max(minimum_fec_packets as usize)
-				.min(MAX_SHARDS.saturating_sub(nr_data_shards));
+			let nr_parity_shards = block.parity;
+			let fec_percentage = block.fec_percentage;
+			let multi_fec_blocks = ((block_index as u8) << 4) | last_block_index;
 
 			let t_fec_encoder = Instant::now();
 			let encoder = if nr_parity_shards > 0 {
@@ -297,9 +368,6 @@ impl Packetizer {
 			};
 			total_fec_encoder_us += t_fec_encoder.elapsed().as_micros();
 
-			// Recompute the actual FEC percentage in case of a rounding error or when there are 0 parity shards.
-			let fec_percentage = nr_parity_shards * 100 / nr_data_shards;
-
 			tracing::trace!(
 				"Sending block {block_index} with {nr_data_shards} data shards and {nr_parity_shards} parity shards."
 			);
@@ -307,15 +375,15 @@ impl Packetizer {
 			// Single allocation for all shards in this block (data + parity), zeroed.
 			let total_shards = nr_data_shards + nr_parity_shards;
 			let t_alloc = Instant::now();
-			let mut shard_buf = ShardBuf::new(total_shards, requested_shard_size, prefix_size);
+			let mut shard_buf = ShardBuf::new(total_shards, shard_size, prefix_size);
 			total_alloc_us += t_alloc.elapsed().as_micros();
 
 			let t_data_write = Instant::now();
 
 			// Write data shards directly into the flat buffer.
-			for (block_shard_index, data_shard_index) in (start..end).enumerate() {
-				let payload_start = data_shard_index * requested_shard_payload_size;
-				let payload_len = requested_shard_payload_size.min(packet_data_len - payload_start);
+			for (block_shard_index, data_shard_index) in (block.start..block.end).enumerate() {
+				let payload_start = data_shard_index * payload_size;
+				let payload_len = payload_size.min(packet_data_len - payload_start);
 
 				let shard = shard_buf.shard_mut(block_shard_index);
 
@@ -332,24 +400,26 @@ impl Packetizer {
 				if block_shard_index == nr_data_shards - 1 {
 					flags |= RtpFlag::EndOfFrame as u8;
 				}
+				let extra_flags = if data_shard_index == 0 {
+					first_packet_extra_flags
+				} else {
+					0
+				};
 				write_nv_video_packet(
 					&mut shard[NV_PACKET_OFFSET..NV_PACKET_OFFSET + NV_VIDEO_PACKET_SIZE],
 					*sequence_number << 8,
 					frame_number,
 					flags,
-					((block_index as u8) << 4) | last_block_index,
+					extra_flags,
+					multi_fec_blocks,
 					(block_shard_index << 12 | nr_data_shards << 22 | fec_percentage << 4) as u32,
 				);
-
-				if data_shard_index == 0 {
-					shard[NV_PACKET_OFFSET + 9] = first_packet_extra_flags;
-				}
 
 				// Copy payload from [header ++ encoded_data].
 				copy_header_and_data(
 					&mut shard[PAYLOAD_OFFSET..],
 					&header_bytes,
-					encoded_data,
+					frame.data,
 					payload_start,
 					payload_len,
 				);
@@ -390,7 +460,7 @@ impl Packetizer {
 					// NvVideoPacket fields that Moonlight needs.
 					let nv = &mut shard[NV_PACKET_OFFSET..NV_PACKET_OFFSET + NV_VIDEO_PACKET_SIZE];
 					nv[4..8].copy_from_slice(&frame_number.to_le_bytes()); // frame_index
-					nv[11] = ((block_index as u8) << 4) | last_block_index; // multi_fec_blocks
+					nv[11] = multi_fec_blocks; // multi_fec_blocks
 					let fec_info = ((nr_data_shards + block_shard_index) << 12
 						| nr_data_shards << 22
 						| fec_percentage << 4) as u32;
@@ -430,18 +500,12 @@ impl Packetizer {
 			let t_extend = Instant::now();
 			all_shards.extend_from(&shard_buf.into_batch());
 			total_extend_us += t_extend.elapsed().as_micros();
-
-			tracing::trace!("Finished sending frame {frame_number}.");
-
-			if block_index == 3 {
-				break;
-			}
 		}
 
+		tracing::trace!("Finished packetizing frame {frame_number}.");
 		tracing::trace!(
 			"Packetize breakdown: alloc_us={total_alloc_us} data_write_us={total_data_write_us} fec_encoder_us={total_fec_encoder_us} fec_compute_us={total_fec_compute_us} fec_headers_us={total_fec_headers_us} extend_us={total_extend_us}",
 		);
-
 		Ok(all_shards)
 	}
 
@@ -468,6 +532,36 @@ impl Packetizer {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn coded_frame_fits_one_block_with_parity() {
+		assert_eq!(
+			plan_coded_blocks(10, 20, 2),
+			vec![BlockPlan {
+				start: 0,
+				end: 10,
+				parity: 2,
+				fec_percentage: 20
+			}]
+		);
+	}
+
+	#[test]
+	fn coded_frame_past_four_blocks_sends_the_rest_without_parity() {
+		// 20% FEC leaves 213 data shards per block.
+		let plan = plan_coded_blocks(1000, 20, 2);
+		assert_eq!(plan.len(), 4);
+		assert_eq!((plan[2].start, plan[2].end, plan[2].parity), (426, 639, 42));
+		assert_eq!(
+			plan[3],
+			BlockPlan {
+				start: 639,
+				end: 1000,
+				parity: 0,
+				fec_percentage: 0
+			}
+		);
+	}
 
 	fn packetizer(encrypted: bool) -> Packetizer {
 		let (_, keys) = tokio::sync::watch::channel(crate::session::SessionKeyData {
