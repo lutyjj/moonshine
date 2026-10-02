@@ -21,8 +21,8 @@ use crate::session::SessionKeysReceiver;
 use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrMetadata, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 
+use crate::session::stream::video::PacketBatch;
 use crate::session::stream::video::packetizer::Packetizer;
-use crate::session::stream::video::shard_batch::ShardBatch;
 use crate::session::stream::video::{
 	FrameStats, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamConfig, VideoStreamContext,
 };
@@ -279,7 +279,7 @@ impl Drop for InFlightGuard {
 #[allow(clippy::too_many_arguments)]
 async fn run_packet_consumer(
 	mut ctx_rx: mpsc::Receiver<ConsumerMessage>,
-	packet_tx: mpsc::Sender<ShardBatch>,
+	packet_tx: mpsc::Sender<PacketBatch>,
 	stats_tx: broadcast::Sender<FrameStats>,
 	in_flight: Arc<AtomicUsize>,
 	idr_tx: broadcast::Sender<()>,
@@ -419,12 +419,18 @@ async fn run_packet_consumer(
 		// session is already tearing down. Stop the consumer; the encoding thread
 		// then sees its `frame_ctx_tx` fail and exits too, which drops the
 		// video-pipeline shutdown token and tears the session down.
-		if packet_tx.send(shards).await.is_err() {
+		let (sent, completed) = tokio::sync::oneshot::channel();
+		if packet_tx.send(PacketBatch { shards, sent }).await.is_err() {
 			tracing::debug!("Couldn't send packet batch, video packet channel closed.");
 			break;
 		}
 
-		let t_sent = std::time::Instant::now();
+		// Keep the frame in the capture budget until pacing and socket sends finish.
+		let t_sent = match completed.await {
+			Ok(Some(t_sent)) => t_sent,
+			Ok(None) => continue,
+			Err(_) => break,
+		};
 
 		let packetize_dur = t_packetized - t_start;
 		let send_dur = t_sent - t_packetized;
@@ -494,7 +500,7 @@ impl VideoPipeline {
 		config: VideoStreamConfig,
 		context: VideoStreamContext,
 		keys_rx: SessionKeysReceiver,
-		packet_tx: mpsc::Sender<ShardBatch>,
+		packet_tx: mpsc::Sender<PacketBatch>,
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
@@ -552,7 +558,7 @@ impl VideoPipelineInner {
 		self,
 		runtime: tokio::runtime::Handle,
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
-		packet_tx: mpsc::Sender<ShardBatch>,
+		packet_tx: mpsc::Sender<PacketBatch>,
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
@@ -685,7 +691,7 @@ impl VideoPipelineInner {
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		context: VideoContext,
 		mut encoder: Encoder,
-		packet_tx: mpsc::Sender<ShardBatch>,
+		packet_tx: mpsc::Sender<PacketBatch>,
 		idr_tx: broadcast::Sender<()>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
@@ -756,9 +762,8 @@ impl VideoPipelineInner {
 			VideoDynamicRange::Hdr => ColorDescription::bt2020_pq().with_full_range(ctx.full_range),
 		});
 
+		let mut pending_idr = false;
 		while !stop_session_manager.is_shutdown_triggered() {
-			let mut pending_idr = false;
-
 			// Drain any pending stream-reset requests (client reconnect/resume).
 			//
 			// Moonlight starts every (re)connected session with its frame counter at 1
@@ -836,12 +841,13 @@ impl VideoPipelineInner {
 					// If we have a pending IDR request and have encoded before,
 					// re-encode the encoder's input image (still contains
 					// the last frame's data after color conversion).
-					if pending_idr && has_encoded {
+					if pending_idr && has_encoded && in_flight.load(Ordering::Relaxed) < MAX_FRAMES_IN_FLIGHT {
 						tracing::debug!("Re-encoding last frame for IDR request (no re-import)");
 						// Use current time as created_at for the re-encoded IDR (no actual frame).
 						let now = std::time::Instant::now();
 						match encoder.encode(encoder.input_image()) {
 							Ok(future) => {
+								pending_idr = false;
 								let submitted_at = std::time::Instant::now();
 								let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
 								let frame_context = FrameContext {
@@ -881,8 +887,7 @@ impl VideoPipelineInner {
 				// far behind, skip this capture *before* encoding it so the stream
 				// stays realtime instead of accumulating latency. Dropping pre-encode
 				// keeps the encoded P-frame chain valid (a skipped frame never enters
-				// the encoder's reference state). The IDR re-encode path is never
-				// gated — the client needs that keyframe.
+				// the encoder's reference state). Pending IDRs also wait for a slot.
 				if in_flight.load(Ordering::Relaxed) >= MAX_FRAMES_IN_FLIGHT {
 					if last_drop_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
 						tracing::warn!(
@@ -1085,6 +1090,7 @@ impl VideoPipelineInner {
 
 				match encode_result {
 					Ok(future) => {
+						pending_idr = false;
 						// Hand this frame's context plus its packet future to the
 						// consumer thread, which awaits the future, injects HDR SEI if
 						// needed, packetizes and sends it, and records stats.
@@ -1167,7 +1173,7 @@ impl VideoPipelineInner {
 	fn spawn_packet_consumer(
 		&self,
 		runtime: &tokio::runtime::Handle,
-		packet_tx: mpsc::Sender<ShardBatch>,
+		packet_tx: mpsc::Sender<PacketBatch>,
 		stats_tx: broadcast::Sender<FrameStats>,
 		idr_tx: broadcast::Sender<()>,
 	) -> PacketConsumer {
@@ -1226,10 +1232,70 @@ fn forward_hdr_state(last: &mut HdrModeState, new: HdrModeState, tx: &watch::Sen
 mod tests {
 	use super::*;
 	use crate::session::SessionKeyData;
-	use crate::session::stream::video::shard_batch::ShardBatch;
 	use ash::vk;
 	use pixelforge::{InputFormat, PixelForgeError};
 	use std::time::{Duration, Instant};
+
+	#[tokio::test]
+	async fn frames_remain_in_flight_until_socket_completion() {
+		use std::future::Future;
+		use std::task::Poll;
+
+		let (frame_tx, frame_rx) = mpsc::channel(3);
+		let (packet_tx, mut packet_rx) = mpsc::channel(128);
+		let (stats_tx, mut stats_rx) = broadcast::channel(3);
+		let (idr_tx, _) = broadcast::channel(1);
+		let (_, keys) = watch::channel(crate::session::SessionKeyData {
+			remote_input_key: Vec::new(),
+			remote_input_key_id: 0,
+		});
+		let in_flight = Arc::new(AtomicUsize::new(2));
+		let created = std::time::Instant::now();
+		for _ in 0..2 {
+			frame_tx
+				.send(ConsumerMessage::Frame(
+					FrameContext::immediate(created),
+					PendingFrame::Ready(EncodedFrame {
+						data: Bytes::from_static(&[0; 100]),
+						is_key_frame: true,
+						record_layout: None,
+					}),
+				))
+				.await
+				.unwrap();
+		}
+		let consumer = run_packet_consumer(
+			frame_rx,
+			packet_tx,
+			stats_tx,
+			in_flight.clone(),
+			idr_tx,
+			Packetizer::new(false, keys),
+			VideoStreamContext {
+				fps: 60,
+				packet_size: 1392,
+				..Default::default()
+			},
+			VideoStreamConfig::default(),
+		);
+		tokio::pin!(consumer);
+		assert!(std::future::poll_fn(|cx| Poll::Ready(consumer.as_mut().poll(cx).is_pending())).await);
+		let first = packet_rx.try_recv().unwrap();
+		assert_eq!(in_flight.load(Ordering::Relaxed), 2);
+		assert!(packet_rx.try_recv().is_err());
+		assert!(stats_rx.try_recv().is_err());
+
+		let sent_at = std::time::Instant::now();
+		first.sent.send(Some(sent_at)).unwrap();
+		assert!(std::future::poll_fn(|cx| Poll::Ready(consumer.as_mut().poll(cx).is_pending())).await);
+		assert_eq!(in_flight.load(Ordering::Relaxed), 1);
+		assert_eq!(stats_rx.try_recv().unwrap().total, sent_at - created);
+		let second = packet_rx.try_recv().unwrap();
+		drop(second.sent);
+		assert!(std::future::poll_fn(|cx| Poll::Ready(consumer.as_mut().poll(cx).is_ready())).await);
+		assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+		assert!(stats_rx.try_recv().is_err());
+	}
 
 	// DRM fourccs — kept in the test module to document the byte ordering
 	// explicitly and guard against accidental typos in the production match.
@@ -1324,7 +1390,7 @@ mod tests {
 
 	fn start_consumer(
 		frames: mpsc::Receiver<ConsumerMessage>,
-		packets: mpsc::Sender<ShardBatch>,
+		packets: mpsc::Sender<PacketBatch>,
 		stats: broadcast::Sender<FrameStats>,
 		in_flight: Arc<AtomicUsize>,
 	) -> tokio::task::JoinHandle<()> {
@@ -1366,21 +1432,22 @@ mod tests {
 		frames.send(ConsumerMessage::ResetCounters).await.unwrap();
 		frames.send(ready_frame(start + 2 * step)).await.unwrap();
 		drop(frames);
+		for (frame_number, timestamp, sequence) in [(1, 0, 0), (2, 900, 2), (1, 1800, 0)] {
+			let batch = packets.recv().await.unwrap();
+			let first = &batch.shards.as_bytes()[..batch.shards.shard_size()];
+			assert_eq!(u16::from_be_bytes(first[2..4].try_into().unwrap()), sequence);
+			assert_eq!(u32::from_be_bytes(first[4..8].try_into().unwrap()), timestamp);
+			assert_eq!(u32::from_le_bytes(first[20..24].try_into().unwrap()), frame_number);
+			batch.sent.send(Some(Instant::now())).unwrap();
+			let report = reports.recv().await.unwrap();
+			assert_eq!(report.encoded_bytes, 100);
+			assert!(report.is_key_frame);
+		}
 		tokio::time::timeout(Duration::from_secs(2), consumer)
 			.await
 			.unwrap()
 			.unwrap();
 		assert_eq!(in_flight.load(Ordering::Relaxed), 0);
-		for (frame_number, timestamp, sequence) in [(1, 0, 0), (2, 900, 2), (1, 1800, 0)] {
-			let batch = packets.recv().await.unwrap();
-			let first = &batch.as_bytes()[..batch.shard_size()];
-			assert_eq!(u16::from_be_bytes(first[2..4].try_into().unwrap()), sequence);
-			assert_eq!(u32::from_be_bytes(first[4..8].try_into().unwrap()), timestamp);
-			assert_eq!(u32::from_le_bytes(first[20..24].try_into().unwrap()), frame_number);
-			let report = reports.recv().await.unwrap();
-			assert_eq!(report.encoded_bytes, 100);
-			assert!(report.is_key_frame);
-		}
 		assert!(packets.recv().await.is_none());
 	}
 

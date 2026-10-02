@@ -1,20 +1,27 @@
 use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::session::SessionKeysReceiver;
 use crate::session::compositor::frame::{ExportedFrame, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 
 mod gso_socket;
+mod pacer;
 mod packetizer;
 mod pipeline;
 mod pyrowave_framing;
 mod shard_batch;
 use gso_socket::UdpGsoSocket;
+use pacer::Pacer;
 use pipeline::VideoPipeline;
 pub(crate) use pipeline::probe_pyrowave;
 use shard_batch::ShardBatch;
+
+struct PacketBatch {
+	shards: ShardBatch,
+	sent: oneshot::Sender<Option<std::time::Instant>>,
+}
 
 /// Configuration for the video stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,6 +55,15 @@ pub struct VideoStreamConfig {
 	/// and 8-byte UDP headers and the 16-byte stream overhead).
 	#[serde(default)]
 	pub max_packet_size: usize,
+
+	/// Rate at which a frame's packets are sent, in megabits per second.
+	///
+	/// A frame that left as one burst can overrun the queue of a slower link
+	/// on the way or the client's receive buffer, so its packets are spread
+	/// out at this rate. `0` disables pacing. Set a rate below the slowest
+	/// link on the path, allowing room for packet headers and FEC.
+	#[serde(default)]
+	pub send_rate_mbps: u32,
 }
 
 /// Smallest accepted packet size cap. Lower values would leave almost no room
@@ -83,6 +99,7 @@ impl Default for VideoStreamConfig {
 			encrypt: false,
 			log_frame_spikes: false,
 			max_packet_size: 0,
+			send_rate_mbps: 0,
 		}
 	}
 }
@@ -106,7 +123,7 @@ pub struct FrameStats {
 	pub encode_wait: std::time::Duration,
 	/// Time spent packetizing the encoded data.
 	pub packetize: std::time::Duration,
-	/// Time spent sending the packets over the channel.
+	/// Time from packetization until network sends finish, including pacing.
 	pub send: std::time::Duration,
 	/// Total end-to-end latency for this frame.
 	pub total: std::time::Duration,
@@ -342,10 +359,11 @@ impl VideoStream {
 		let (reset_tx, _reset_rx) = broadcast::channel(1);
 
 		// Packet channel.
-		let (packet_tx, packet_rx) = mpsc::channel::<ShardBatch>(128);
+		let (packet_tx, packet_rx) = mpsc::channel::<PacketBatch>(1);
 
 		// Spawn packet handler — gated behind start.
-		spawn_handle_video_packets(packet_rx, socket, start.subscribe(), stop.clone());
+		let pacer = Pacer::new(config.send_rate_mbps);
+		spawn_handle_video_packets(packet_rx, socket, pacer, start.subscribe(), stop.clone());
 
 		// Spawn pipeline thread — gated behind start.
 		VideoPipeline::new(
@@ -375,8 +393,9 @@ impl VideoStream {
 }
 
 fn spawn_handle_video_packets(
-	mut packet_rx: mpsc::Receiver<ShardBatch>,
+	mut packet_rx: mpsc::Receiver<PacketBatch>,
 	socket: UdpGsoSocket,
+	mut pacer: Pacer,
 	mut start: watch::Receiver<bool>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 ) {
@@ -403,16 +422,17 @@ fn spawn_handle_video_packets(
 			tokio::select! {
 				batch = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
 					match batch {
-						Ok(Some(batch)) => {
+						Ok(Some(PacketBatch { shards, sent })) => {
 							if let Some(addr) = client_address {
-								if batch.shard_count() == 0 {
+								if shards.shard_count() == 0 {
+									let _ = sent.send(None);
 									continue;
 								}
 
 								// Sends are wrapped in wrap_cancel so a socket that
 								// stops draining cannot block session shutdown.
 								match stop_session_manager
-									.wrap_cancel(socket.send_batch(&batch, addr))
+									.wrap_cancel(socket.send_batch(&shards, addr, &mut pacer))
 									.await
 								{
 									Ok(failed_chunks) => {
@@ -428,6 +448,10 @@ fn spawn_handle_video_packets(
 									},
 									Err(_) => break,
 								}
+
+								let _ = sent.send(Some(std::time::Instant::now()));
+							} else {
+								let _ = sent.send(None);
 							}
 						},
 						Ok(None) => {
@@ -472,7 +496,7 @@ mod tests {
 		let (packet_tx, packet_rx) = mpsc::channel(1);
 		let (start, mut encoder_start) = watch::channel(false);
 		let stop = ShutdownManager::new();
-		spawn_handle_video_packets(packet_rx, socket, start.subscribe(), stop.clone());
+		spawn_handle_video_packets(packet_rx, socket, Pacer::new(0), start.subscribe(), stop.clone());
 
 		// Start before the spawned task has been polled, as the bench does.
 		let (idr_tx, _) = broadcast::channel(1);
@@ -490,15 +514,18 @@ mod tests {
 			.await
 			.expect("encoder start signal lost")
 			.unwrap();
+		let (sent, completed) = oneshot::channel();
 		packet_tx
-			.send(shard_batch::ShardBuf::new(0, 1392, 0).into_batch())
+			.send(PacketBatch {
+				shards: shard_batch::ShardBuf::new(0, 1392, 0).into_batch(),
+				sent,
+			})
 			.await
 			.unwrap();
-		let permit = tokio::time::timeout(timeout, packet_tx.reserve())
+		tokio::time::timeout(timeout, completed)
 			.await
 			.expect("packet handler did not start")
 			.unwrap();
-		drop(permit);
 		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
 		tokio::time::timeout(timeout, packet_tx.closed()).await.unwrap();
 	}
@@ -509,9 +536,13 @@ mod tests {
 		let (packet_tx, packet_rx) = mpsc::channel(1);
 		let (start, started) = watch::channel(false);
 		let stop = ShutdownManager::new();
-		spawn_handle_video_packets(packet_rx, socket, started, stop.clone());
+		spawn_handle_video_packets(packet_rx, socket, Pacer::new(0), started, stop.clone());
+		let (sent, _completed) = oneshot::channel();
 		packet_tx
-			.send(shard_batch::ShardBuf::new(0, 1392, 0).into_batch())
+			.send(PacketBatch {
+				shards: shard_batch::ShardBuf::new(0, 1392, 0).into_batch(),
+				sent,
+			})
 			.await
 			.unwrap();
 		assert!(
@@ -538,7 +569,7 @@ mod tests {
 		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
 		let (packet_tx, packet_rx) = mpsc::channel(1);
 		let (start, started) = watch::channel(false);
-		spawn_handle_video_packets(packet_rx, socket, started, ShutdownManager::new());
+		spawn_handle_video_packets(packet_rx, socket, Pacer::new(0), started, ShutdownManager::new());
 		drop(start);
 		tokio::time::timeout(std::time::Duration::from_secs(1), packet_tx.closed())
 			.await
@@ -551,7 +582,7 @@ mod tests {
 		let (packet_tx, packet_rx) = mpsc::channel(1);
 		let (_start, started) = watch::channel(false);
 		let stop = ShutdownManager::new();
-		spawn_handle_video_packets(packet_rx, socket, started, stop.clone());
+		spawn_handle_video_packets(packet_rx, socket, Pacer::new(0), started, stop.clone());
 		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
 		tokio::time::timeout(std::time::Duration::from_secs(1), packet_tx.closed())
 			.await

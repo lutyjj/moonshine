@@ -1,6 +1,7 @@
 use quinn_udp::{Transmit, UdpSockRef, UdpSocketState};
 use tokio::net::UdpSocket;
 
+use super::pacer::Pacer;
 use super::shard_batch::ShardBatch;
 
 /// Maximum payload of one UDP datagram (65535 minus IPv4/UDP headers).
@@ -8,6 +9,9 @@ use super::shard_batch::ShardBatch;
 /// with EMSGSIZE before segmenting. IPv6 allows 20 more bytes; the IPv4
 /// value is safe for both.
 const MAX_UDP_PAYLOAD: usize = 65507;
+
+/// Shards per paced chunk when GSO is unavailable.
+const SHARDS_PER_CHUNK_WITHOUT_GSO: usize = 16;
 
 /// Number of shards per GSO send: the kernel's segment-count cap or the
 /// datagram-size cap, whichever binds first. Never zero, even for a shard
@@ -62,35 +66,39 @@ impl UdpGsoSocket {
 		self.socket.recv_from(buf).await
 	}
 
-	/// Send a shard batch to `addr`.
+	/// Send a frame's shard batch to `addr`, paced by `pacer`.
 	///
 	/// Returns the number of chunks that fell back to per-shard sends because
 	/// the kernel rejected the GSO send (0 on success).
 	///
-	/// GSO availability is re-checked on every call: quinn-udp disables it at
-	/// runtime if the kernel or NIC rejects a segmented send.
-	pub async fn send_batch(&self, batch: &ShardBatch, addr: std::net::SocketAddr) -> u32 {
-		if self.udp_state.max_gso_segments() > 1 {
-			self.send_batch_gso(batch, addr).await
-		} else {
-			self.send_shards(batch.as_bytes(), batch.shard_size(), addr).await;
-			0
-		}
-	}
-
-	/// Send a batch as GSO chunks sized to the kernel's segment and datagram
-	/// caps; a frame's batch routinely exceeds both. Uses `try_send` because
-	/// `send` masks every error except `WouldBlock` as success, silently
-	/// discarding the batch.
-	async fn send_batch_gso(&self, batch: &ShardBatch, addr: std::net::SocketAddr) -> u32 {
+	/// The batch goes out in chunks sized to the kernel's GSO segment and
+	/// datagram caps; a frame's batch routinely exceeds both. GSO availability
+	/// is re-checked on every call: quinn-udp disables it at runtime if the
+	/// kernel or NIC rejects a segmented send. Without GSO the chunks are sent
+	/// per shard.
+	pub async fn send_batch(&self, batch: &ShardBatch, addr: std::net::SocketAddr, pacer: &mut Pacer) -> u32 {
 		let shard_size = batch.shard_size();
 		if shard_size == 0 {
 			return 0;
 		}
-		let segments_per_send = gso_segments_per_send(self.udp_state.max_gso_segments(), shard_size);
+		let max_gso_segments = self.udp_state.max_gso_segments();
+		let gso = max_gso_segments > 1;
+		let segments_per_send = if gso {
+			gso_segments_per_send(max_gso_segments, shard_size)
+		} else {
+			SHARDS_PER_CHUNK_WITHOUT_GSO
+		};
 
+		pacer.start_frame();
 		let mut failed_chunks = 0u32;
 		for chunk in batch.as_bytes().chunks(segments_per_send * shard_size) {
+			pacer.pace(chunk.len()).await;
+			if !gso {
+				self.send_shards(chunk, shard_size, addr).await;
+				continue;
+			}
+			// `try_send` because `send` masks every error except `WouldBlock`
+			// as success, silently discarding the chunk.
 			let transmit = Transmit {
 				destination: addr,
 				ecn: None,
@@ -133,6 +141,46 @@ impl UdpGsoSocket {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	const SHARD_SIZE: usize = 1392;
+
+	fn batch(shards: usize) -> ShardBatch {
+		crate::session::stream::video::shard_batch::ShardBuf::new(shards, SHARD_SIZE, 0).into_batch()
+	}
+
+	#[tokio::test]
+	async fn a_large_batch_is_paced() {
+		let sender = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+		// One megabyte at 800 Mbps takes ten milliseconds.
+		let mut pacer = Pacer::new(800);
+		let started = std::time::Instant::now();
+		sender
+			.send_batch(&batch(720), receiver.local_addr().unwrap(), &mut pacer)
+			.await;
+		let elapsed = started.elapsed();
+		assert!(elapsed >= std::time::Duration::from_millis(8), "sent in {elapsed:?}");
+	}
+
+	#[tokio::test]
+	async fn a_batch_arrives_whole() {
+		// Few enough shards to fit a default receive buffer.
+		const SHARDS: usize = 40;
+		let sender = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+		let mut pacer = Pacer::new(800);
+		sender
+			.send_batch(&batch(SHARDS), receiver.local_addr().unwrap(), &mut pacer)
+			.await;
+
+		let mut buf = [0; 2048];
+		for _ in 0..SHARDS {
+			let received = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv(&mut buf));
+			assert_eq!(received.await.expect("shards went missing").unwrap(), SHARD_SIZE);
+		}
+	}
 
 	#[test]
 	fn gso_segment_count_cap_binds() {
