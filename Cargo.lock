@@ -2483,6 +2483,8 @@ dependencies = [
  "async-shutdown",
  "clap",
  "moonshine-core",
+ "pyrowave",
+ "socket2",
  "tokio",
  "tracing",
  "tracing-subscriber",
