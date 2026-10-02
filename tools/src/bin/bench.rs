@@ -30,7 +30,7 @@ struct Args {
 	/// Command to run (application to spawn).
 	command: Vec<String>,
 
-	/// Run the built-in 4K/1440p/1080p x 60/120/360 FPS x HEVC/H.264/AV1 benchmark matrix.
+	/// Run the built-in 4K/1440p/1080p x 60/120/360 FPS x HEVC/H.264/AV1/PyroWave benchmark matrix.
 	#[arg(long)]
 	matrix: bool,
 
@@ -47,7 +47,7 @@ struct Args {
 	bitrate: usize,
 
 	/// Video codec.
-	#[arg(long, default_value = "h264", value_parser = ["h264", "hevc", "av1"])]
+	#[arg(long, default_value = "h264", value_parser = ["h264", "hevc", "av1", "pyrowave"])]
 	codec: String,
 
 	/// Seconds to run before stopping (0 = run until Ctrl+C).
@@ -61,6 +61,10 @@ struct Args {
 	/// Enable HDR mode.
 	#[arg(long)]
 	hdr: bool,
+
+	/// Encode with full chroma resolution (4:4:4).
+	#[arg(long)]
+	yuv444: bool,
 
 	/// Print per-frame stats to stderr instead of periodic summary.
 	#[arg(long)]
@@ -82,6 +86,7 @@ fn parse_codec(s: &str) -> VideoFormat {
 		"h264" => VideoFormat::H264,
 		"hevc" => VideoFormat::Hevc,
 		"av1" => VideoFormat::Av1,
+		"pyrowave" => VideoFormat::PyroWave,
 		_ => unreachable!(),
 	}
 }
@@ -413,7 +418,7 @@ async fn run_single(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 async fn run_matrix(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 	const RESOLUTIONS: [(&str, &str); 3] = [("4k", "3840x2160"), ("1440p", "2560x1440"), ("1080p", "1920x1080")];
 	const FPS_VALUES: [u32; 3] = [60, 120, 360];
-	const CODECS: [&str; 3] = ["hevc", "h264", "av1"];
+	const CODECS: [&str; 4] = ["hevc", "h264", "av1", "pyrowave"];
 
 	let duration = if args.duration == 0 {
 		tracing::info!("Matrix mode requires a finite duration; defaulting to 8s. Pass --duration to override.");
@@ -595,9 +600,14 @@ async fn run_benchmark(
 		} else {
 			VideoDynamicRange::Sdr
 		},
-		chroma_sampling_type: VideoChromaSampling::Yuv420,
+		chroma_sampling_type: if args.yuv444 {
+			VideoChromaSampling::Yuv444
+		} else {
+			VideoChromaSampling::Yuv420
+		},
 		max_reference_frames: 1,
-		full_range: false,
+		// PyroWave encodes full range, which Moonlight's Vulkan renderer requests.
+		full_range: video_format == VideoFormat::PyroWave,
 		encrypt_video: false,
 	};
 
