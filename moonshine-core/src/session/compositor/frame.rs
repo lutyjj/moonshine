@@ -3,7 +3,8 @@
 //! `ExportedFrame` is the single frame-exchange type between the compositor
 //! and the video pipeline. It replaces the PipeWire-based `CapturedFrame`.
 
-use std::os::unix::io::RawFd;
+use smithay::backend::allocator::Buffer;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
@@ -97,10 +98,10 @@ impl HdrMetadata {
 
 /// A compositor frame exported for encoding.
 ///
-/// Plane file descriptors are borrowed references to the compositor's
-/// pre-allocated GBM buffer pool.  The pool lives for the entire streaming
-/// session, so the fds remain valid.  The `consumed` flag prevents the
-/// compositor from recycling a buffer before the encoder finishes reading.
+/// Plane file descriptors borrow either a GBM pool buffer or a retained client
+/// buffer. The compositor keeps that storage alive and prevents reuse until the
+/// encoder sets `consumed` after its last read. A client buffer is exported as
+/// committed: the compositor does not wait for the client's rendering.
 #[derive(Debug, Clone)]
 pub(crate) struct ExportedFrame {
 	/// Per-plane DMA-BUF metadata.
@@ -117,10 +118,11 @@ pub(crate) struct ExportedFrame {
 	pub created_at: Instant,
 	/// Index of the pre-allocated GBM buffer in the compositor's pool.
 	pub buffer_index: usize,
-	/// Shared flag set to `true` by the encoder after color conversion
-	/// completes, signalling the compositor that this GBM buffer may be
-	/// reused for rendering.
+	/// Set to `true` after the encoder's last read, allowing the compositor to
+	/// reuse a pool buffer or release a retained client buffer.
 	pub consumed: Arc<AtomicBool>,
+	/// Scanout import failures request composition; publish before `consumed`.
+	pub import_failed: Option<Arc<AtomicBool>>,
 	/// Color space of the rendered frame.
 	pub color_space: FrameColorSpace,
 	/// Optional HDR metadata from the composited content.
@@ -139,4 +141,38 @@ pub(crate) struct ExportedPlane {
 	pub offset: u32,
 	/// Row stride in bytes.
 	pub stride: u32,
+}
+
+/// The caller retains the DMA-BUF until the exported frame is consumed.
+pub(crate) fn export_dmabuf(
+	dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf,
+	buffer_index: usize,
+	consumed: Arc<AtomicBool>,
+	surface_color_space: Option<FrameColorSpace>,
+	hdr_metadata: Option<HdrMetadata>,
+) -> Result<ExportedFrame, String> {
+	let planes: Vec<ExportedPlane> = dmabuf
+		.handles()
+		.zip(dmabuf.offsets())
+		.zip(dmabuf.strides())
+		.map(|((handle, offset), stride)| ExportedPlane {
+			fd: handle.as_raw_fd(),
+			offset,
+			stride,
+		})
+		.collect();
+
+	Ok(ExportedFrame {
+		planes,
+		format: dmabuf.format().code as u32,
+		modifier: Into::<u64>::into(dmabuf.format().modifier),
+		width: dmabuf.width(),
+		height: dmabuf.height(),
+		created_at: std::time::Instant::now(),
+		buffer_index,
+		consumed,
+		import_failed: None,
+		color_space: surface_color_space.unwrap_or(FrameColorSpace::Srgb),
+		hdr_metadata,
+	})
 }

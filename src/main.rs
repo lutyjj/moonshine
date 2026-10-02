@@ -225,6 +225,7 @@ impl Moonshine {
 				config.stream.video.clone(),
 				config.stream.audio.clone(),
 				config.stream.control.clone(),
+				supported_codecs,
 				session_manager.clone(),
 				shutdown.clone(),
 			),

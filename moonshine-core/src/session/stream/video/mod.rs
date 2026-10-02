@@ -12,6 +12,7 @@ mod pipeline;
 mod shard_batch;
 use gso_socket::UdpGsoSocket;
 use pipeline::VideoPipeline;
+pub(crate) use pipeline::probe_pyrowave;
 use shard_batch::ShardBatch;
 
 /// Configuration for the video stream.
@@ -120,6 +121,8 @@ pub enum VideoFormat {
 	H264,
 	Hevc,
 	Av1,
+	/// Intra-only wavelet codec: every frame is a key frame.
+	PyroWave,
 }
 
 impl TryFrom<u32> for VideoFormat {
@@ -130,6 +133,7 @@ impl TryFrom<u32> for VideoFormat {
 			0 => Ok(Self::H264),
 			1 => Ok(Self::Hevc),
 			2 => Ok(Self::Av1),
+			3 => Ok(Self::PyroWave),
 			_ => Err(()),
 		}
 	}

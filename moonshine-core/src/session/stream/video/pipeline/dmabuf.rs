@@ -53,7 +53,7 @@ pub(crate) struct DmaBufPlane {
 /// reused when all of these match the new request; a mismatch on the same fd
 /// means the fd number was recycled for a different buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ImportParams {
+pub(super) struct ImportParams {
 	width: u32,
 	height: u32,
 	format: vk::Format,
@@ -64,7 +64,7 @@ struct ImportParams {
 }
 
 impl ImportParams {
-	fn new(width: u32, height: u32, format: vk::Format, planes: &[DmaBufPlane]) -> Self {
+	pub(super) fn new(width: u32, height: u32, format: vk::Format, planes: &[DmaBufPlane]) -> Self {
 		let mut plane_layouts = [(0, 0); 4];
 		for (i, p) in planes.iter().take(4).enumerate() {
 			plane_layouts[i] = (p.offset, p.stride);

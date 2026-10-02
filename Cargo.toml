@@ -2,6 +2,9 @@
 members = [".", "moonshine-core", "moonshine-tools", "moonshine-wsi"]
 resolver = "2"
 
+[workspace.dependencies]
+pyrowave = { git = "https://github.com/lutyjj/pyrowave-rs", rev = "d5a249c7aa8472b1c6f289b90c11a871c73ea17b" }
+
 [workspace.package]
 version = "0.16.1"
 

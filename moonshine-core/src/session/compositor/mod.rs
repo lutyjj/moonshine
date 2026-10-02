@@ -21,7 +21,7 @@ use std::sync::mpsc;
 use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
-use smithay::backend::allocator::{Fourcc, Modifier};
+use smithay::backend::allocator::{Fourcc, Modifier, format::FormatSet};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::{Capability, GlesRenderer};
@@ -230,7 +230,46 @@ impl LaunchedCompositor {
 	}
 }
 
-/// Main compositor loop running on a dedicated thread.
+pub(crate) fn select_render_format(render_formats: &FormatSet, hdr: bool) -> Option<(Fourcc, Vec<Modifier>)> {
+	// FP16 preserves scRGB highlights above 1.0; SDR prefers the Vulkan WSI
+	// channel order to avoid red/blue swaps during GL blits.
+	let preferred_fourccs: Vec<Fourcc> = if hdr {
+		vec![
+			Fourcc::Abgr16161616f,
+			Fourcc::Abgr2101010,
+			Fourcc::Abgr8888,
+			Fourcc::Xbgr8888,
+		]
+	} else {
+		vec![Fourcc::Abgr8888, Fourcc::Xbgr8888, Fourcc::Argb8888, Fourcc::Xrgb8888]
+	};
+	preferred_fourccs
+		.iter()
+		.find_map(|&fourcc| {
+			let modifiers: Vec<Modifier> = render_formats
+				.iter()
+				.filter(|f| f.code == fourcc)
+				.map(|f| f.modifier)
+				.collect();
+			if modifiers.is_empty() {
+				None
+			} else {
+				Some((fourcc, modifiers))
+			}
+		})
+		.or_else(|| {
+			// Fall back to first available format, collecting all its modifiers.
+			let first = render_formats.iter().next()?;
+			let fourcc = first.code;
+			let modifiers: Vec<Modifier> = render_formats
+				.iter()
+				.filter(|f| f.code == fourcc)
+				.map(|f| f.modifier)
+				.collect();
+			Some((fourcc, modifiers))
+		})
+}
+
 fn run_compositor(
 	config: CompositorConfig,
 	context: CompositorContext,
@@ -291,49 +330,7 @@ fn run_compositor(
 	let render_formats = renderer.egl_context().dmabuf_render_formats();
 	tracing::debug!("Supported DMA-BUF render formats: {}", render_formats.iter().count());
 
-	// Select preferred render format based on HDR mode.
-	// HDR: prefer FP16 > 10-bit > 8-bit ABGR. FP16 is required for scRGB
-	// (EXTENDED_SRGB_LINEAR) content whose HDR highlights carry values > 1.0 that a
-	// 10-bit UNORM render buffer would clamp at composite time; it also holds
-	// BT.2020+PQ content (values in [0,1]) losslessly for the passthrough path.
-	// SDR: prefer 8-bit ABGR/XBGR to match Vulkan WSI and avoid GL R↔B channel swaps.
-	// Vulkan WSI on Wayland defaults to XBGR/ABGR formats, so using ARGB causes
-	// GL to incorrectly swap red/blue channels during blit operations.
-	let preferred_fourccs: Vec<Fourcc> = if config.hdr && context.hdr {
-		vec![
-			Fourcc::Abgr16161616f,
-			Fourcc::Abgr2101010,
-			Fourcc::Abgr8888,
-			Fourcc::Xbgr8888,
-		]
-	} else {
-		vec![Fourcc::Abgr8888, Fourcc::Xbgr8888, Fourcc::Argb8888, Fourcc::Xrgb8888]
-	};
-	let (render_fourcc, render_modifiers) = preferred_fourccs
-		.iter()
-		.find_map(|&fourcc| {
-			let modifiers: Vec<Modifier> = render_formats
-				.iter()
-				.filter(|f| f.code == fourcc)
-				.map(|f| f.modifier)
-				.collect();
-			if modifiers.is_empty() {
-				None
-			} else {
-				Some((fourcc, modifiers))
-			}
-		})
-		.or_else(|| {
-			// Fall back to first available format, collecting all its modifiers.
-			let first = render_formats.iter().next()?;
-			let fourcc = first.code;
-			let modifiers: Vec<Modifier> = render_formats
-				.iter()
-				.filter(|f| f.code == fourcc)
-				.map(|f| f.modifier)
-				.collect();
-			Some((fourcc, modifiers))
-		})
+	let (render_fourcc, render_modifiers) = select_render_format(render_formats, config.hdr && context.hdr)
 		.ok_or_else(|| "No supported DMA-BUF render formats found".to_string())?;
 
 	tracing::debug!(
