@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -27,13 +28,10 @@ use super::{
 };
 use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
-use crate::session::stream::video::packetizer::Packetizer;
+use crate::session::stream::video::packetizer::{NV_VIDEO_PACKET_SIZE, Packetizer};
+use crate::session::stream::video::pyrowave_framing;
 use crate::session::stream::video::shard_batch::ShardBatch;
 use crate::session::stream::video::{FrameStats, VideoChromaSampling, VideoDynamicRange, VideoStreamContext};
-
-// Mark the first record explicitly so the client does not guess record
-// boundaries after loss. Native records may straddle later payload boundaries.
-const RECORD_START: u8 = 0x80;
 
 struct Import {
 	params: ImportParams,
@@ -50,6 +48,7 @@ const IMPORT_IDLE_EVICTION: Duration = Duration::from_secs(5);
 pub(super) struct PyroWaveEncoder {
 	encoder: Encoder,
 	intermediate_precision: IntermediatePrecision,
+	critical_blocks: usize,
 	imports: HashMap<RawFd, Import>,
 }
 
@@ -72,6 +71,7 @@ impl PyroWaveEncoder {
 				chroma,
 			},
 		)?;
+		let critical_blocks = encoder.active_blocks(2)?;
 		tracing::info!(
 			width = ctx.width,
 			height = ctx.height,
@@ -82,6 +82,7 @@ impl PyroWaveEncoder {
 		Ok(Self {
 			encoder,
 			intermediate_precision,
+			critical_blocks,
 			imports: HashMap::new(),
 		})
 	}
@@ -224,8 +225,10 @@ impl VideoPipelineInner {
 			task: consumer,
 		} = self.spawn_packet_consumer(&runtime, packet_tx, stats_tx, idr_tx);
 
-		let capacity = Packetizer::frame_capacity(ctx.packet_size, self.config.fec_percentage)
+		let capacity = Packetizer::pyrowave_frame_capacity(ctx.packet_size, self.config.fec_percentage > 0)
 			.ok_or_else(|| "Invalid PyroWave packet size".to_string())?;
+		let critical_blocks = encoder.critical_blocks;
+		let payload_size = ctx.packet_size - NV_VIDEO_PACKET_SIZE;
 		let session_hdr = ctx.dynamic_range == VideoDynamicRange::Hdr;
 
 		let budget = frame_budget(ctx.bitrate, ctx.fps, capacity);
@@ -237,7 +240,7 @@ impl VideoPipelineInner {
 		);
 		let mut last_frame_time = Instant::now();
 		let mut last_hdr_state = HdrModeState::new(session_hdr);
-		let mut last_frame: Option<Bytes> = None;
+		let mut last_frame: Option<EncodedFrame> = None;
 		let mut last_drop_warn: Option<Instant> = None;
 		// Set by a reset or IDR request until the next frame goes out.
 		let mut resend = false;
@@ -267,17 +270,13 @@ impl VideoPipelineInner {
 						last_frame_time = Instant::now();
 					}
 					// Answer recovery requests even when the captured image is static.
-					if let Some(data) = &last_frame
+					if let Some(previous) = &last_frame
 						&& resend && in_flight.load(Ordering::Relaxed) < MAX_FRAMES_IN_FLIGHT
 					{
 						let now = Instant::now();
 						let context = FrameContext::immediate(now);
 						in_flight.fetch_add(1, Ordering::Relaxed);
-						let packet = EncodedFrame {
-							data: data.clone(),
-							is_key_frame: true,
-							first_packet_extra_flags: RECORD_START,
-						};
+						let packet = previous.clone();
 						if frame_ctx_tx
 							.blocking_send(ConsumerMessage::Frame(context, PendingFrame::Ready(packet)))
 							.is_err()
@@ -324,11 +323,7 @@ impl VideoPipelineInner {
 			frame.consumed.store(true, Ordering::Release);
 			let t_encoded = Instant::now();
 
-			let bitstream = encoded?;
-			if bitstream.len() > capacity {
-				return Err("PyroWave frame exceeds the transport capacity".into());
-			}
-			let data = Bytes::copy_from_slice(bitstream);
+			let framed = pyrowave_framing::frame(encoded?, critical_blocks, payload_size, capacity)?;
 
 			let t_ready = Instant::now();
 
@@ -353,16 +348,14 @@ impl VideoPipelineInner {
 				buffer_index: frame.buffer_index,
 			};
 			in_flight.fetch_add(1, Ordering::Relaxed);
-			last_frame = Some(data.clone());
+			let packet = EncodedFrame {
+				data: Bytes::from(framed.data),
+				is_key_frame: true,
+				record_layout: Some(Arc::new(framed.layout)),
+			};
+			last_frame = Some(packet.clone());
 			if frame_ctx_tx
-				.blocking_send(ConsumerMessage::Frame(
-					context,
-					PendingFrame::Ready(EncodedFrame {
-						data,
-						is_key_frame: true,
-						first_packet_extra_flags: RECORD_START,
-					}),
-				))
+				.blocking_send(ConsumerMessage::Frame(context, PendingFrame::Ready(packet)))
 				.is_err()
 			{
 				tracing::debug!("Packet consumer gone; stopping encoding loop.");

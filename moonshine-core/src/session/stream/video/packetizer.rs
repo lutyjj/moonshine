@@ -8,12 +8,13 @@ use std::time::Instant;
 
 use crate::session::SessionKeysReceiver;
 
+use crate::session::stream::video::pyrowave_framing::RecordLayout;
 use crate::session::stream::video::shard_batch::{ShardBatch, ShardBuf};
 
 /// Maximum allowed number of shards in the encoder (data + parity).
 pub(crate) const MAX_SHARDS: usize = 255;
 
-const NV_VIDEO_PACKET_SIZE: usize = 16;
+pub(crate) const NV_VIDEO_PACKET_SIZE: usize = 16;
 const RTP_HEADER_SIZE: usize = 12;
 const PADDING_SIZE: usize = 4;
 /// Byte offset where the NvVideoPacket starts within a shard.
@@ -31,6 +32,9 @@ enum RtpFlag {
 	StartOfFrame = 0x4,
 }
 
+/// `extraFlags` bit: the payload's frame data starts with a PyroWave record.
+const EXTRA_FLAG_PYROWAVE_RECORD_START: u8 = 0x80;
+
 const FRAME_TYPE_KEY: u8 = 2;
 const FRAME_TYPE_PREDICTED: u8 = 1;
 
@@ -40,19 +44,25 @@ struct VideoFrameHeader {
 	header_type: u8,
 	frame_processing_latency: u16,
 	frame_type: u8,
-	last_payload_len: u32,
+	last_payload_len: u16,
+	/// PyroWave's critical packet count. Other clients ignore these bytes.
+	pyrowave_critical_packets: u16,
 }
 
-const VIDEO_FRAME_HEADER_SIZE: usize = 8;
+pub(crate) const VIDEO_FRAME_HEADER_SIZE: usize = 8;
 
 impl VideoFrameHeader {
 	fn serialize(&self, buffer: &mut [u8]) {
 		buffer[0] = self.header_type;
 		buffer[1..3].copy_from_slice(&self.frame_processing_latency.to_le_bytes());
 		buffer[3] = self.frame_type;
-		buffer[4..8].copy_from_slice(&self.last_payload_len.to_le_bytes());
+		buffer[4..6].copy_from_slice(&self.last_payload_len.to_le_bytes());
+		buffer[6..8].copy_from_slice(&self.pyrowave_critical_packets.to_le_bytes());
 	}
 }
+
+/// `fecInfo` holds the shard index and count in 10 bits each.
+const MAX_DATA_SHARDS_WITHOUT_PARITY: usize = 1023;
 
 /// One FEC block: data shards `[start, end)` plus `parity` parity shards.
 /// Clients derive the parity count as `ceil(data * fec_percentage / 100)`.
@@ -101,6 +111,59 @@ fn plan_coded_blocks(nr_data_shards: usize, fec_percentage: u8, minimum_fec_pack
 			}
 		})
 		.collect()
+}
+
+/// Only critical packets carry parity, as block 0. The client minimum is
+/// bounded by the Reed-Solomon block size and wire percentage field.
+fn plan_pyrowave_blocks(
+	nr_data_shards: usize,
+	critical_packets: usize,
+	critical_fec_percentage: u8,
+	minimum_fec_packets: u32,
+) -> Vec<BlockPlan> {
+	let critical = critical_packets.min(nr_data_shards);
+	let mut plan = Vec::with_capacity(4);
+	let mut start = 0;
+	if critical > 0 && critical_fec_percentage > 0 {
+		// The wire stores an eight-bit percentage; the client rounds it up
+		// to a parity count. Bound both that representation and the RS block.
+		let maximum_percentage = (MAX_SHARDS.saturating_sub(critical) * 100 / critical).min(255);
+		let fec_percentage = (critical_fec_percentage as usize)
+			.max((minimum_fec_packets as usize * 100).div_ceil(critical))
+			.min(maximum_percentage);
+		let parity = (critical * fec_percentage).div_ceil(100);
+		if parity > 0 {
+			plan.push(BlockPlan {
+				start: 0,
+				end: critical,
+				parity,
+				fec_percentage,
+			});
+			start = critical;
+		}
+	}
+
+	let remaining_blocks = 4 - plan.len();
+	let rest = nr_data_shards - start;
+	if rest > 0 {
+		// Keep blocks at the usual 255 shards when that fits, otherwise grow them.
+		let per_block = if rest <= remaining_blocks * MAX_SHARDS {
+			MAX_SHARDS
+		} else {
+			rest.div_ceil(remaining_blocks).min(MAX_DATA_SHARDS_WITHOUT_PARITY)
+		};
+		while start < nr_data_shards && plan.len() < 4 {
+			let end = (start + per_block).min(nr_data_shards);
+			plan.push(BlockPlan {
+				start,
+				end,
+				parity: 0,
+				fec_percentage: 0,
+			});
+			start = end;
+		}
+	}
+	plan
 }
 
 /// Write an RTP header directly into a byte slice at offset 0.
@@ -225,6 +288,16 @@ impl Packetizer {
 		Some((3 * (MAX_SHARDS - parity) + 1023) * payload - VIDEO_FRAME_HEADER_SIZE)
 	}
 
+	/// Conservative capacity with one block reserved for critical parity.
+	pub fn pyrowave_frame_capacity(requested_packet_size: usize, critical_fec: bool) -> Option<usize> {
+		Self::frame_capacity(requested_packet_size, 0)?;
+		let blocks = if critical_fec { 3 } else { 4 };
+		Some(
+			blocks * MAX_DATA_SHARDS_WITHOUT_PARITY * (requested_packet_size - NV_VIDEO_PACKET_SIZE)
+				- VIDEO_FRAME_HEADER_SIZE,
+		)
+	}
+
 	/// Update the cipher if the encryption key has rotated.
 	/// Called eagerly at the start of each `packetize()` call.
 	fn maybe_update_cipher(&mut self) {
@@ -268,7 +341,7 @@ impl Packetizer {
 		tracing::debug!("FEC encoder cache warmed with {} entries.", self.fec_encoders.len());
 	}
 
-	/// Packetize an encoded frame into a batch of network-ready shards.
+	/// Packetize an H.264/HEVC/AV1 frame into a batch of network-ready shards.
 	///
 	/// Returns a `ShardBatch` containing all data + parity shards packed
 	/// contiguously in a single allocation per block.
@@ -277,7 +350,6 @@ impl Packetizer {
 		&mut self,
 		encoded_data: &[u8],
 		is_key_frame: bool,
-		first_packet_extra_flags: u8,
 		requested_packet_size: usize,
 		minimum_fec_packets: u32,
 		fec_percentage: u8,
@@ -296,13 +368,61 @@ impl Packetizer {
 			} else {
 				FRAME_TYPE_PREDICTED
 			},
-			last_payload_len: frame.last_payload_len.into(),
+			last_payload_len: frame.last_payload_len,
+			pyrowave_critical_packets: 0,
 		};
 		self.emit(
 			&frame,
 			&header,
 			&plan,
-			first_packet_extra_flags,
+			&[],
+			frame_number,
+			sequence_number,
+			rtp_timestamp,
+		)
+	}
+
+	/// Packetize a record-framed PyroWave frame.
+	#[allow(clippy::too_many_arguments)]
+	pub fn packetize_pyrowave(
+		&mut self,
+		data: &[u8],
+		records: &RecordLayout,
+		requested_packet_size: usize,
+		critical_fec_percentage: u8,
+		minimum_fec_packets: u32,
+		frame_number: u32,
+		sequence_number: &mut u32,
+		rtp_timestamp: u32,
+		frame_processing_latency: u16,
+	) -> Result<ShardBatch, ()> {
+		let layout = FrameLayout::new(data, requested_packet_size)?;
+		let plan = plan_pyrowave_blocks(
+			layout.nr_data_shards,
+			records.critical_packets as usize,
+			critical_fec_percentage,
+			minimum_fec_packets,
+		);
+		// The encoder's byte budget should prevent this; never send a cut-off frame.
+		if plan.last().map(|block| block.end) != Some(layout.nr_data_shards) {
+			tracing::warn!(
+				"PyroWave frame {frame_number} needs {} packets, more than four FEC blocks hold.",
+				layout.nr_data_shards
+			);
+			return Err(());
+		}
+		let header = VideoFrameHeader {
+			header_type: 0x01,
+			frame_processing_latency,
+			frame_type: FRAME_TYPE_KEY,
+			last_payload_len: layout.last_payload_len,
+			pyrowave_critical_packets: records.critical_packets,
+		};
+		self.emit(
+			&layout,
+			&header,
+			&plan,
+			&records.record_starts,
 			frame_number,
 			sequence_number,
 			rtp_timestamp,
@@ -310,14 +430,14 @@ impl Packetizer {
 	}
 
 	/// Write the frame's data shards per `plan`, compute each block's parity,
-	/// and encrypt.
+	/// and encrypt. `record_starts[i]` sets the PyroWave record-start flag on data shard `i`.
 	#[allow(clippy::too_many_arguments)]
 	fn emit(
 		&mut self,
 		frame: &FrameLayout,
 		header: &VideoFrameHeader,
 		plan: &[BlockPlan],
-		first_packet_extra_flags: u8,
+		record_starts: &[bool],
 		frame_number: u32,
 		sequence_number: &mut u32,
 		rtp_timestamp: u32,
@@ -400,8 +520,8 @@ impl Packetizer {
 				if block_shard_index == nr_data_shards - 1 {
 					flags |= RtpFlag::EndOfFrame as u8;
 				}
-				let extra_flags = if data_shard_index == 0 {
-					first_packet_extra_flags
+				let extra_flags = if record_starts.get(data_shard_index).copied().unwrap_or(false) {
+					EXTRA_FLAG_PYROWAVE_RECORD_START
 				} else {
 					0
 				};
@@ -532,6 +652,7 @@ impl Packetizer {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::session::stream::video::pyrowave_framing::FramedPyroWave;
 
 	#[test]
 	fn coded_frame_fits_one_block_with_parity() {
@@ -563,6 +684,134 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn pyrowave_shards_carry_the_critical_count_and_record_flags() {
+		const PACKET_SIZE: usize = 1392;
+		let payload_size = PACKET_SIZE - NV_VIDEO_PACKET_SIZE;
+		// Three payloads of frame data: the first two are critical, the third
+		// starts in the middle of a record.
+		let frame = FramedPyroWave {
+			data: vec![0xAB; payload_size * 3 - VIDEO_FRAME_HEADER_SIZE - 100],
+			layout: RecordLayout {
+				record_starts: vec![true, true, false],
+				critical_packets: 2,
+			},
+		};
+		let mut sequence_number = 0;
+		let batch = packetizer(false)
+			.packetize_pyrowave(
+				&frame.data,
+				&frame.layout,
+				PACKET_SIZE,
+				20,
+				2,
+				7,
+				&mut sequence_number,
+				0,
+				0,
+			)
+			.unwrap();
+
+		// Two critical shards with two parity shards, then one unprotected shard.
+		assert_eq!(batch.shard_count(), 5);
+		assert_eq!(sequence_number, 5);
+		let shards: Vec<&[u8]> = batch.as_bytes().chunks_exact(batch.shard_size()).collect();
+		let extra_flags: Vec<u8> = shards.iter().map(|shard| shard[NV_PACKET_OFFSET + 9]).collect();
+		assert_eq!(extra_flags[0], EXTRA_FLAG_PYROWAVE_RECORD_START);
+		assert_eq!(extra_flags[1], EXTRA_FLAG_PYROWAVE_RECORD_START);
+		assert_eq!(extra_flags[4], 0);
+
+		let fec_info =
+			|shard: &[u8]| u32::from_le_bytes(shard[NV_PACKET_OFFSET + 12..NV_PACKET_OFFSET + 16].try_into().unwrap());
+		// Block 0: two data shards at 100% parity. Block 1: one data shard, none.
+		assert_eq!(fec_info(shards[0]), 2 << 22 | 100 << 4);
+		assert_eq!(fec_info(shards[3]), 2 << 22 | 3 << 12 | 100 << 4);
+		assert_eq!(fec_info(shards[4]), 1 << 22);
+		assert_eq!(shards[0][NV_PACKET_OFFSET + 11], 1 << 6);
+		assert_eq!(shards[4][NV_PACKET_OFFSET + 11], 1 << 4 | 1 << 6);
+
+		let header = &shards[0][PAYLOAD_OFFSET..PAYLOAD_OFFSET + VIDEO_FRAME_HEADER_SIZE];
+		assert_eq!(header[3], FRAME_TYPE_KEY);
+		assert_eq!(u16::from_le_bytes([header[4], header[5]]) as usize, payload_size - 100);
+		assert_eq!(u16::from_le_bytes([header[6], header[7]]), 2);
+	}
+
+	#[test]
+	fn pyrowave_frame_past_four_blocks_is_rejected() {
+		const PACKET_SIZE: usize = 1392;
+		let payload_size = PACKET_SIZE - NV_VIDEO_PACKET_SIZE;
+		let frame = FramedPyroWave {
+			data: vec![0; payload_size * (4 * MAX_DATA_SHARDS_WITHOUT_PARITY + 1)],
+			layout: RecordLayout {
+				record_starts: Vec::new(),
+				critical_packets: 0,
+			},
+		};
+		assert!(
+			packetizer(false)
+				.packetize_pyrowave(&frame.data, &frame.layout, PACKET_SIZE, 20, 2, 1, &mut 0, 0, 0)
+				.is_err()
+		);
+	}
+
+	#[test]
+	fn pyrowave_protects_only_the_critical_packets() {
+		let plan = plan_pyrowave_blocks(400, 30, 20, 2);
+		assert_eq!(
+			plan[0],
+			BlockPlan {
+				start: 0,
+				end: 30,
+				parity: 6,
+				fec_percentage: 20
+			}
+		);
+		assert!(plan[1..].iter().all(|b| b.parity == 0 && b.end - b.start <= MAX_SHARDS));
+		assert_eq!(plan.last().unwrap().end, 400);
+		assert!(plan.len() <= 4);
+	}
+
+	#[test]
+	fn pyrowave_critical_parity_honors_the_client_minimum() {
+		assert_eq!(plan_pyrowave_blocks(50, 4, 20, 2)[0].parity, 2);
+		assert_eq!(plan_pyrowave_blocks(50, 4, 20, 7)[0].parity, 7);
+		assert_eq!(plan_pyrowave_blocks(50, 4, 20, 0)[0].parity, 1);
+		let block = plan_pyrowave_blocks(50, 1, 20, u32::MAX)[0];
+		assert_eq!(block.fec_percentage, 255);
+		assert_eq!(block.parity, 3);
+		assert!(plan_pyrowave_blocks(50, 4, 0, 7).iter().all(|b| b.parity == 0));
+	}
+
+	#[test]
+	fn pyrowave_without_a_critical_count_sends_no_parity() {
+		let plan = plan_pyrowave_blocks(300, 0, 20, 2);
+		assert!(plan.iter().all(|b| b.parity == 0));
+		assert_eq!(plan.last().unwrap().end, 300);
+	}
+
+	#[test]
+	fn large_pyrowave_frames_grow_blocks_past_255_shards() {
+		let plan = plan_pyrowave_blocks(2900, 100, 20, 2);
+		assert_eq!(plan.len(), 4);
+		assert!(
+			plan[1..]
+				.iter()
+				.all(|b| b.end - b.start <= MAX_DATA_SHARDS_WITHOUT_PARITY)
+		);
+		assert_eq!(plan.last().unwrap().end, 2900);
+	}
+
+	#[test]
+	fn pyrowave_critical_parity_matches_what_the_client_derives() {
+		for nr_data_shards in [1, 2, 7, 13, 99, 150, 230] {
+			let block = plan_pyrowave_blocks(nr_data_shards + 10, nr_data_shards, 20, 2)[0];
+			if block.parity > 0 {
+				assert_eq!((nr_data_shards * block.fec_percentage).div_ceil(100), block.parity);
+				assert!(block.parity >= 2);
+			}
+		}
+	}
+
 	fn packetizer(encrypted: bool) -> Packetizer {
 		let (_, keys) = tokio::sync::watch::channel(crate::session::SessionKeyData {
 			remote_input_key: vec![0x42; 16],
@@ -571,7 +820,7 @@ mod tests {
 		Packetizer::new(encrypted, keys)
 	}
 
-	fn reassemble(batch: &ShardBatch, encrypted: bool, first_flags: u8) -> Vec<u8> {
+	fn reassemble(batch: &ShardBatch, encrypted: bool) -> Vec<u8> {
 		let cipher = Aes128Gcm::new_from_slice(&[0x42; 16]).unwrap();
 		let mut bytes = Vec::new();
 		let mut last_payload_len = 0;
@@ -597,7 +846,7 @@ mod tests {
 			if index >= data_count {
 				continue;
 			}
-			assert_eq!(packet[25], if data_packets == 0 { first_flags } else { 0 });
+			assert_eq!(packet[25], 0);
 			if data_packets == 0 {
 				assert_eq!(packet[32], 1);
 				assert_eq!(packet[35], 2);
@@ -617,13 +866,11 @@ mod tests {
 	fn frames_preserve_data_across_blocks() {
 		let data: Vec<u8> = (0..20_004).map(|i| (i % 251) as u8).collect();
 		for encrypted in [false, true] {
-			for first_flags in [0, 0x80] {
-				let batch = packetizer(encrypted)
-					.packetize(&data, true, first_flags, 80, 2, 20, 7, &mut 0, 3000, 10)
-					.unwrap();
-				assert!(batch.shard_count() > 255, "exercise multiple FEC blocks");
-				assert_eq!(reassemble(&batch, encrypted, first_flags), data);
-			}
+			let batch = packetizer(encrypted)
+				.packetize(&data, true, 80, 2, 20, 7, &mut 0, 3000, 10)
+				.unwrap();
+			assert!(batch.shard_count() > 255, "exercise multiple FEC blocks");
+			assert_eq!(reassemble(&batch, encrypted), data);
 		}
 	}
 
@@ -635,16 +882,42 @@ mod tests {
 		assert_eq!(Packetizer::frame_capacity(80, 20), Some(capacity));
 		let data = vec![0x5a; capacity];
 		let mut packetizer = packetizer(false);
-		let batch = packetizer
-			.packetize(&data, true, 0x80, 80, 0, 20, 1, &mut 0, 0, 0)
-			.unwrap();
-		assert_eq!(reassemble(&batch, false, 0x80), data);
+		let batch = packetizer.packetize(&data, true, 80, 0, 20, 1, &mut 0, 0, 0).unwrap();
+		assert_eq!(reassemble(&batch, false), data);
 		for size in [0, 1, 15, 16, 65552, usize::MAX] {
 			assert!(
 				packetizer
-					.packetize(&[0; 8], true, 0x80, size, 0, 20, 1, &mut 0, 0, 0)
+					.packetize(&[0; 8], true, size, 0, 20, 1, &mut 0, 0, 0)
 					.is_err()
 			);
 		}
+	}
+
+	#[test]
+	fn invalid_sizes_and_unrepresentable_frames_are_rejected() {
+		let (_, keys) = tokio::sync::watch::channel(crate::session::SessionKeyData {
+			remote_input_key: Vec::new(),
+			remote_input_key_id: 0,
+		});
+		let mut packetizer = Packetizer::new(false, keys);
+		let layout = RecordLayout {
+			record_starts: vec![true],
+			critical_packets: 1,
+		};
+		for size in [0, 1, 15, 16, 65552, usize::MAX] {
+			assert!(Packetizer::pyrowave_frame_capacity(size, true).is_none());
+			assert!(
+				packetizer
+					.packetize_pyrowave(&[0; 100], &layout, size, 20, 2, 1, &mut 0, 0, 0)
+					.is_err()
+			);
+		}
+		assert_eq!(Packetizer::pyrowave_frame_capacity(80, true), Some(196_408));
+		assert_eq!(Packetizer::pyrowave_frame_capacity(80, false), Some(261_880));
+		assert!(
+			packetizer
+				.packetize_pyrowave(&vec![0; 262_144], &layout, 80, 20, 2, 1, &mut 0, 0, 0)
+				.is_err()
+		);
 	}
 }
