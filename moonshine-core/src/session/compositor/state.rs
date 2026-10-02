@@ -57,7 +57,7 @@ use smithay::xwayland::X11Wm;
 
 use super::KeyboardConfig;
 use crate::session::compositor::cursor::{self, PointerElement, PointerRenderElement};
-use crate::session::compositor::frame::{ExportedFrame, ExportedPlane, FrameColorSpace, HdrMetadata};
+use crate::session::compositor::frame::{ExportedFrame, ExportedPlane, FrameColorSpace, export_dmabuf};
 
 /// Number of pre-allocated GBM buffers. Three allows the compositor to
 /// always have a free buffer: at most two frames are queued in the
@@ -71,6 +71,20 @@ pub(crate) struct GbmBufferSlot {
 	/// Shared with the encoder — `true` means the encoder is done reading
 	/// and the compositor may render into this buffer again.
 	consumed: Arc<AtomicBool>,
+}
+
+struct ScanoutBuffer {
+	consumed: Arc<AtomicBool>,
+	import_failed: Arc<AtomicBool>,
+	buffer: smithay::backend::renderer::utils::Buffer,
+}
+
+fn scanout_layout(dmabuf: &Dmabuf) -> (u32, u64, usize) {
+	(
+		dmabuf.format().code as u32,
+		dmabuf.format().modifier.into(),
+		dmabuf.num_planes(),
+	)
 }
 
 // Combined render element type for compositing space + cursor elements.
@@ -436,15 +450,10 @@ pub(crate) struct MoonshineCompositor {
 	pub transient_children: std::collections::HashMap<u32, Vec<smithay::desktop::Window>>,
 
 	// -- Direct scanout --
-	/// Client buffers held alive during direct scanout until the encoder
-	/// signals `consumed`. Each entry pairs a consumed flag, the wl_buffer
-	/// ObjectId (for `scanout_buffer_map` cleanup), and the cloned Smithay
-	/// `Buffer` (keeps wl_buffer from being released).
-	held_scanout_buffers: Vec<(
-		Arc<AtomicBool>,
-		smithay::reexports::wayland_server::backend::ObjectId,
-		smithay::backend::renderer::utils::Buffer,
-	)>,
+	/// Retained until the encoder publishes consumption and import feedback.
+	held_scanout_buffers: Vec<ScanoutBuffer>,
+	/// Failed layouts use composition for the rest of this session.
+	rejected_scanout_layouts: std::collections::HashSet<(u32, u64, usize)>,
 	/// Maps wl_buffer ObjectIds to stable buffer indices for pixelforge's
 	/// dmabuf import cache. Keying by ObjectId is robust against protocols
 	/// that re-duplicate fds per commit (e.g. gamescope_swapchain via
@@ -718,6 +727,7 @@ impl MoonshineCompositor {
 				window_metadata: HashMap::new(),
 				transient_children: std::collections::HashMap::new(),
 				held_scanout_buffers: Vec::new(),
+				rejected_scanout_layouts: Default::default(),
 				scanout_buffer_map: std::collections::HashMap::new(),
 				scanout_next_index: BUFFER_POOL_SIZE,
 				last_scanout_buffer_desc: None,
@@ -1049,23 +1059,29 @@ impl MoonshineCompositor {
 			self.last_cursor_position = self.cursor_position;
 		}
 
-		// Skip rendering when the screen is static and we already sent a
-		// keepalive frame within the last second.
-		if !self.screen_dirty && self.last_frame_sent_at.elapsed() < std::time::Duration::from_secs(1) {
-			return;
-		}
-
 		// Release held scanout buffers that the encoder has finished reading.
 		// Drop their entries from the buffer→index map; if the same wl_buffer
 		// is re-attached later it'll get a fresh index.
-		self.held_scanout_buffers.retain(|(consumed, buffer_id, _)| {
-			if consumed.load(Ordering::Acquire) {
-				self.scanout_buffer_map.remove(buffer_id);
+		self.held_scanout_buffers.retain(|held| {
+			if held.consumed.load(Ordering::Acquire) {
+				if held.import_failed.load(Ordering::Relaxed) {
+					if let Ok(dmabuf) = dmabuf::get_dmabuf(&held.buffer) {
+						self.rejected_scanout_layouts.insert(scanout_layout(dmabuf));
+					}
+					self.screen_dirty = true;
+				}
+				self.scanout_buffer_map.remove(&held.buffer.id());
 				false
 			} else {
 				true
 			}
 		});
+
+		// Skip rendering when the screen is static and we already sent a
+		// keepalive frame within the last second.
+		if !self.screen_dirty && self.last_frame_sent_at.elapsed() < std::time::Duration::from_secs(1) {
+			return;
+		}
 
 		// Try direct scanout: bypass compositor rendering when a single
 		// fullscreen DMA-BUF surface covers the entire output. This avoids
@@ -1466,6 +1482,9 @@ impl MoonshineCompositor {
 			return false;
 		};
 		let client_dmabuf = client_dmabuf.clone();
+		if self.rejected_scanout_layouts.contains(&scanout_layout(&client_dmabuf)) {
+			return false;
+		}
 
 		// The surface buffer must exactly match the output dimensions with
 		// no scaling or offset, otherwise the encoder would receive a
@@ -1513,6 +1532,7 @@ impl MoonshineCompositor {
 			)
 			.collect();
 
+		let import_failed = Arc::new(AtomicBool::new(false));
 		let exported_frame = ExportedFrame {
 			planes,
 			format: client_dmabuf.format().code as u32,
@@ -1522,12 +1542,17 @@ impl MoonshineCompositor {
 			created_at: std::time::Instant::now(),
 			buffer_index,
 			consumed: consumed.clone(),
+			import_failed: Some(import_failed.clone()),
 			color_space,
 			hdr_metadata,
 		};
 
 		// Hold the client Buffer alive until the encoder finishes reading.
-		self.held_scanout_buffers.push((consumed.clone(), buffer_id, buffer));
+		self.held_scanout_buffers.push(ScanoutBuffer {
+			consumed: consumed.clone(),
+			import_failed,
+			buffer,
+		});
 
 		match self.frame_tx.try_send(exported_frame) {
 			Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -1613,6 +1638,9 @@ impl MoonshineCompositor {
 			return false;
 		};
 		let client_dmabuf = client_dmabuf.clone();
+		if self.rejected_scanout_layouts.contains(&scanout_layout(&client_dmabuf)) {
+			return false;
+		}
 
 		if client_dmabuf.width() != self.width || client_dmabuf.height() != self.height {
 			tracing::trace!(
@@ -1677,6 +1705,7 @@ impl MoonshineCompositor {
 			)
 			.collect();
 
+		let import_failed = Arc::new(AtomicBool::new(false));
 		let exported_frame = ExportedFrame {
 			planes,
 			format: client_dmabuf.format().code as u32,
@@ -1686,11 +1715,16 @@ impl MoonshineCompositor {
 			created_at: std::time::Instant::now(),
 			buffer_index,
 			consumed: consumed.clone(),
+			import_failed: Some(import_failed.clone()),
 			color_space,
 			hdr_metadata,
 		};
 
-		self.held_scanout_buffers.push((consumed.clone(), buffer_id, buffer));
+		self.held_scanout_buffers.push(ScanoutBuffer {
+			consumed: consumed.clone(),
+			import_failed,
+			buffer,
+		});
 
 		match self.frame_tx.try_send(exported_frame) {
 			Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -2121,43 +2155,4 @@ impl MoonshineCompositor {
 			tracing::debug!("Dropped X11 window manager");
 		}
 	}
-}
-
-/// Convert a Smithay Dmabuf into our pipeline's ExportedFrame.
-///
-/// Export a DMA-BUF as an `ExportedFrame` for the video encoder.
-///
-/// Plane fds are borrowed (raw fd numbers) from the compositor's buffer pool.
-/// The pool outlives all in-flight frames and the `consumed` flag prevents
-/// buffer recycling before the encoder finishes reading.
-fn export_dmabuf(
-	dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf,
-	buffer_index: usize,
-	consumed: Arc<AtomicBool>,
-	surface_color_space: Option<FrameColorSpace>,
-	hdr_metadata: Option<HdrMetadata>,
-) -> Result<ExportedFrame, String> {
-	let planes: Vec<ExportedPlane> = dmabuf
-		.handles()
-		.zip(dmabuf.offsets())
-		.zip(dmabuf.strides())
-		.map(|((handle, offset), stride)| ExportedPlane {
-			fd: handle.as_raw_fd(),
-			offset,
-			stride,
-		})
-		.collect();
-
-	Ok(ExportedFrame {
-		planes,
-		format: dmabuf.format().code as u32,
-		modifier: Into::<u64>::into(dmabuf.format().modifier),
-		width: dmabuf.width(),
-		height: dmabuf.height(),
-		created_at: std::time::Instant::now(),
-		buffer_index,
-		consumed,
-		color_space: surface_color_space.unwrap_or(FrameColorSpace::Srgb),
-		hdr_metadata,
-	})
 }

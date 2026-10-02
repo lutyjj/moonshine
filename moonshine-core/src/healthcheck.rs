@@ -9,6 +9,11 @@ use std::time::{Duration, Instant};
 use pixelforge::{Codec, VideoContext, VideoContextBuilder};
 
 use crate::config::Config;
+use crate::session::compositor::{frame::export_dmabuf, select_render_format};
+use crate::session::stream::video::{VideoChromaSampling, VideoDynamicRange};
+use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+use smithay::backend::allocator::{Allocator, Fourcc, dmabuf::AsDmabuf, format::FormatSet};
+use std::sync::{Arc, atomic::AtomicBool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckOutcome {
@@ -49,9 +54,7 @@ pub struct Capabilities {
 	pub gpu_name: String,
 }
 
-// Codec mode support bitmask values — single source of truth, also used by the
-// webserver to build the advertised `ServerCodecModeSupport` bitmask from the
-// probed `report.supported_codecs`.
+// Codec bits from the startup probe, advertised over HTTP and used by RTSP negotiation.
 pub const CODEC_H264: u32 = 0x00000001;
 pub const CODEC_HEVC: u32 = 0x00000100;
 pub const CODEC_HEVC_MAIN10: u32 = 0x00000200;
@@ -62,6 +65,11 @@ pub const CODEC_HEVC_REXT_8444: u32 = 0x00080000;
 pub const CODEC_HEVC_REXT_10444: u32 = 0x00100000;
 pub const CODEC_AV1_HIGH_8444: u32 = 0x00200000;
 pub const CODEC_AV1_HIGH_10444: u32 = 0x00400000;
+// PyroWave profiles, as defined by the PyroWave-capable Moonlight fork.
+pub const CODEC_PYROWAVE: u32 = 0x00800000;
+pub const CODEC_PYROWAVE_444: u32 = 0x01000000;
+pub const CODEC_PYROWAVE_HDR10: u32 = 0x02000000;
+pub const CODEC_PYROWAVE_HDR10_444: u32 = 0x04000000;
 
 impl HealthReport {
 	fn add(&mut self, name: &'static str, outcome: CheckOutcome, message: String, duration_ms: u64) {
@@ -233,8 +241,13 @@ fn run_gpu_checks(report: &mut HealthReport, gpu_config: &Option<String>) {
 	// the EGL probe (HDR detection) runs on the GPU the compositor will use.
 	let egl_result = check_egl(report, render_node_open.as_ref().or(render_node.as_ref()));
 	let vk_context = check_vulkan(report);
-	check_codecs(report, vk_context.as_ref());
-	report.dma_buf_supported = check_dmabuf(report, vk_context.as_ref());
+	let video_import = check_dmabuf(report, vk_context.as_ref());
+	let pyrowave_codecs = match (&render_node_open, &egl_result) {
+		(Some(node), Some((_, _, formats))) => check_pyrowave(report, node, formats),
+		_ => 0,
+	};
+	check_codecs(report, vk_context.as_ref().filter(|_| video_import), pyrowave_codecs);
+	report.dma_buf_supported = report.supported_codecs != 0;
 	check_wsi_layer(report);
 
 	if let Some(ref ctx) = vk_context {
@@ -468,7 +481,7 @@ fn check_render_node_open(
 	}
 }
 
-fn check_egl(report: &mut HealthReport, node: Option<&PathBuf>) -> Option<(String, bool, Vec<String>)> {
+fn check_egl(report: &mut HealthReport, node: Option<&PathBuf>) -> Option<(String, bool, FormatSet)> {
 	let start = Instant::now();
 	let node = node?;
 
@@ -556,7 +569,75 @@ fn check_egl(report: &mut HealthReport, node: Option<&PathBuf>) -> Option<(Strin
 	};
 
 	report.add_passed("EGL/GLES", msg, start.elapsed().as_millis() as u64);
-	Some((gpu_name, hdr_supported, format_names))
+	Some((gpu_name, hdr_supported, render_formats.clone()))
+}
+
+fn check_pyrowave(report: &mut HealthReport, node: &Path, formats: &FormatSet) -> u32 {
+	let start = Instant::now();
+	let result = (|| -> Result<u32, String> {
+		let fd = std::fs::OpenOptions::new()
+			.read(true)
+			.write(true)
+			.open(node)
+			.map_err(|e| e.to_string())?;
+		let device = GbmDevice::new(fd).map_err(|e| e.to_string())?;
+		let mut allocator = GbmAllocator::new(device, GbmBufferFlags::RENDERING);
+		let mut supported = 0;
+		for range in [VideoDynamicRange::Sdr, VideoDynamicRange::Hdr] {
+			let hdr = range == VideoDynamicRange::Hdr;
+			let Some((format, modifiers)) = select_render_format(formats, hdr) else {
+				continue;
+			};
+			if hdr && !matches!(format, Fourcc::Abgr16161616f | Fourcc::Abgr2101010) {
+				continue;
+			}
+			let buffer = match allocator
+				.create_buffer(256, 256, format, &modifiers)
+				.map_err(|e| e.to_string())
+				.and_then(|buffer| buffer.export().map_err(|e| e.to_string()))
+			{
+				Ok(buffer) => buffer,
+				Err(e) => {
+					tracing::debug!(?range, "PyroWave probe allocation failed: {e}");
+					continue;
+				},
+			};
+			let frame = export_dmabuf(&buffer, 0, Arc::new(AtomicBool::new(false)), None, None)?;
+			for chroma in [VideoChromaSampling::Yuv420, VideoChromaSampling::Yuv444] {
+				match crate::session::stream::video::probe_pyrowave(&frame, chroma, range) {
+					Ok(()) => supported |= pyrowave_profile(chroma, range),
+					Err(e) => tracing::debug!(?range, ?chroma, "PyroWave import probe failed: {e}"),
+				}
+			}
+		}
+		Ok(supported)
+	})();
+	match result {
+		Ok(mask) if mask != 0 => {
+			report.add_passed(
+				"PyroWave",
+				format!("Encoder and capture-buffer import, profiles {mask:#010x}"),
+				start.elapsed().as_millis() as u64,
+			);
+			mask
+		},
+		result => {
+			let reason = result
+				.err()
+				.unwrap_or_else(|| "No profile passed encoder and capture-buffer import checks".into());
+			report.add_warn("PyroWave", reason, start.elapsed().as_millis() as u64);
+			0
+		},
+	}
+}
+
+pub(crate) fn pyrowave_profile(chroma: VideoChromaSampling, range: VideoDynamicRange) -> u32 {
+	match (chroma, range) {
+		(VideoChromaSampling::Yuv420, VideoDynamicRange::Sdr) => CODEC_PYROWAVE,
+		(VideoChromaSampling::Yuv444, VideoDynamicRange::Sdr) => CODEC_PYROWAVE_444,
+		(VideoChromaSampling::Yuv420, VideoDynamicRange::Hdr) => CODEC_PYROWAVE_HDR10,
+		(VideoChromaSampling::Yuv444, VideoDynamicRange::Hdr) => CODEC_PYROWAVE_HDR10_444,
+	}
 }
 
 fn check_vulkan(report: &mut HealthReport) -> Option<VideoContext> {
@@ -578,54 +659,45 @@ fn check_vulkan(report: &mut HealthReport) -> Option<VideoContext> {
 				vk_version_minor(api_version),
 				vk_version_patch(api_version),
 			);
-			report.add_passed("Vulkan", msg, start.elapsed().as_millis() as u64);
+			report.add_passed("Vulkan Video", msg, start.elapsed().as_millis() as u64);
 			Some(ctx)
 		},
 		Err(e) => {
 			let msg = format!(
-				"  Failed to initialize Vulkan: {e}\n  Ensure Vulkan drivers with video encode support are installed.\n  Requires NVIDIA RTX 20xx+, AMD RDNA2+, or Intel Arc.\n  Ubuntu: `sudo ubuntu-drivers autoinstall`\n  Fedora: `sudo dnf install vulkan-loader mesa-vulkan-drivers`\n  Arch: `sudo pacman -S vulkan-icd-loader vulkan-mesa-layer`"
+				"  Vulkan Video encoder unavailable: {e}\n  Ensure Vulkan drivers with video encode support are installed.\n  Requires NVIDIA RTX 20xx+, AMD RDNA2+, or Intel Arc.\n  Ubuntu: `sudo ubuntu-drivers autoinstall`\n  Fedora: `sudo dnf install vulkan-loader mesa-vulkan-drivers`\n  Arch: `sudo pacman -S vulkan-icd-loader vulkan-mesa-layer`"
 			);
-			report.add_failed("Vulkan", msg, start.elapsed().as_millis() as u64);
+			report.add_warn("Vulkan Video", msg, start.elapsed().as_millis() as u64);
 			None
 		},
 	}
 }
 
-fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
+fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>, pyrowave_codecs: u32) {
 	let start = Instant::now();
-	let ctx = match context {
-		Some(c) => c,
-		None => {
-			report.add_failed(
-				"Codecs",
-				"  Skipped (Vulkan check failed).".into(),
-				start.elapsed().as_millis() as u64,
-			);
-			return;
-		},
-	};
-
-	let mut supported = 0u32;
+	let mut supported = pyrowave_codecs;
 	let mut names = Vec::new();
 
-	if ctx.supports_encode(Codec::H264) {
+	if context.is_some_and(|ctx| ctx.supports_encode(Codec::H264)) {
 		supported |= CODEC_H264;
 		supported |= CODEC_H264_HIGH_8444;
 		names.push("H.264");
 	}
-	if ctx.supports_encode(Codec::H265) {
+	if context.is_some_and(|ctx| ctx.supports_encode(Codec::H265)) {
 		supported |= CODEC_HEVC;
 		supported |= CODEC_HEVC_MAIN10;
 		supported |= CODEC_HEVC_REXT_8444;
 		supported |= CODEC_HEVC_REXT_10444;
 		names.push("HEVC");
 	}
-	if ctx.supports_encode(Codec::AV1) {
+	if context.is_some_and(|ctx| ctx.supports_encode(Codec::AV1)) {
 		supported |= CODEC_AV1_MAIN8;
 		supported |= CODEC_AV1_MAIN10;
 		supported |= CODEC_AV1_HIGH_8444;
 		supported |= CODEC_AV1_HIGH_10444;
 		names.push("AV1");
+	}
+	if pyrowave_codecs != 0 {
+		names.push("PyroWave");
 	}
 
 	report.supported_codecs = supported;
@@ -633,7 +705,8 @@ fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
 	if names.is_empty() {
 		report.add_failed(
 			"Codecs",
-			"  No video encode codec supported (H.264, HEVC, AV1).\n  GPU driver may be outdated or missing Vulkan Video extensions.\n  Update to the latest GPU driver.".into(),
+			"  No usable video encoder (H.264, HEVC, AV1, PyroWave).\n  See the backend and DMA-BUF checks above."
+				.into(),
 			start.elapsed().as_millis() as u64,
 		);
 	} else {
@@ -643,16 +716,8 @@ fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
 
 fn check_dmabuf(report: &mut HealthReport, context: Option<&VideoContext>) -> bool {
 	let start = Instant::now();
-	let ctx = match context {
-		Some(c) => c,
-		None => {
-			report.add_failed(
-				"DMA-BUF",
-				"  Skipped (Vulkan check failed).".into(),
-				start.elapsed().as_millis() as u64,
-			);
-			return false;
-		},
+	let Some(ctx) = context else {
+		return false;
 	};
 
 	let instance = ctx.instance();
@@ -661,8 +726,8 @@ fn check_dmabuf(report: &mut HealthReport, context: Option<&VideoContext>) -> bo
 	let extensions = match unsafe { instance.enumerate_device_extension_properties(physical_device) } {
 		Ok(exts) => exts,
 		Err(e) => {
-			report.add_failed(
-				"DMA-BUF",
+			report.add_warn(
+				"Video DMA-BUF",
 				format!("  Failed to enumerate Vulkan device extensions: {e}"),
 				start.elapsed().as_millis() as u64,
 			);
@@ -682,7 +747,7 @@ fn check_dmabuf(report: &mut HealthReport, context: Option<&VideoContext>) -> bo
 
 	if has_ext_mem_fd && has_drm_mod {
 		report.add_passed(
-			"DMA-BUF",
+			"Video DMA-BUF",
 			"VK_KHR_external_memory_fd, VK_EXT_image_drm_format_modifier".into(),
 			start.elapsed().as_millis() as u64,
 		);
@@ -695,8 +760,8 @@ fn check_dmabuf(report: &mut HealthReport, context: Option<&VideoContext>) -> bo
 		if !has_drm_mod {
 			missing.push("VK_EXT_image_drm_format_modifier");
 		}
-		report.add_failed(
-			"DMA-BUF",
+		report.add_warn(
+			"Video DMA-BUF",
 			format!(
 				"  Missing extensions: {}\n  DMA-BUF import is required for zero-copy video encoding.\n  Update GPU drivers to the latest version.",
 				missing.join(", ")
@@ -1237,4 +1302,42 @@ pub(crate) fn find_render_node(gpu_config: &Option<String>) -> Result<PathBuf, S
 	}
 
 	Ok(best_node.unwrap_or_else(|| entries[0].path()))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn pyrowave_is_available_without_vulkan_video() {
+		let mut report = HealthReport {
+			checks: vec![],
+			all_fatal_passed: true,
+			supported_codecs: 0,
+			hdr_supported: false,
+			dma_buf_supported: false,
+			gpu_name: String::new(),
+			duration: Duration::ZERO,
+		};
+		check_codecs(&mut report, None, CODEC_PYROWAVE);
+		assert!(report.all_fatal_passed);
+		assert_eq!(report.supported_codecs, 0x00800000);
+		assert_eq!(report.checks[0].outcome, CheckOutcome::Passed);
+	}
+
+	#[test]
+	fn no_usable_encoder_fails_startup() {
+		let mut report = HealthReport {
+			checks: vec![],
+			all_fatal_passed: true,
+			supported_codecs: 0,
+			hdr_supported: false,
+			dma_buf_supported: false,
+			gpu_name: String::new(),
+			duration: Duration::ZERO,
+		};
+		check_codecs(&mut report, None, 0);
+		assert!(!report.all_fatal_passed);
+		assert_eq!(report.supported_codecs, 0);
+	}
 }
