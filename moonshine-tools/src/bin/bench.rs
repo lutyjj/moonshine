@@ -1,5 +1,8 @@
 use std::net::UdpSocket;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+mod decode_check;
 
 use async_shutdown::ShutdownManager;
 use clap::Parser;
@@ -70,6 +73,16 @@ struct Args {
 	/// refresh tick.
 	#[arg(long)]
 	capture_on_commit: bool,
+
+	/// Reassemble received data shards and check frame completeness.
+	/// Sample PyroWave decoding; FEC recovery is not performed.
+	#[arg(long)]
+	decode_check: bool,
+
+	/// Write the last frame the decode check decoded to this Y4M file.
+	/// Implies `--decode-check`; PyroWave only.
+	#[arg(long, value_name = "FILE")]
+	dump_frame: Option<PathBuf>,
 
 	/// Print per-frame stats to stderr instead of periodic summary.
 	#[arg(long)]
@@ -645,10 +658,34 @@ async fn run_benchmark(
 	// address and actually transmits encoded frames over UDP (otherwise all
 	// packets are silently dropped waiting for a Moonlight client to connect).
 	let ping_addr: std::net::SocketAddr = "127.0.0.1:47998".parse().unwrap();
-	if let Ok(ping_sock) = UdpSocket::bind("127.0.0.1:0") {
-		let _ = ping_sock.send_to(b"PING", ping_addr);
-		tracing::debug!("Sent PING to video socket at {ping_addr}");
-	}
+	let decode_check = if args.decode_check || args.dump_frame.is_some() {
+		let pyrowave = (video_format == VideoFormat::PyroWave).then(|| decode_check::PyroWaveStream {
+			format: pyrowave::VideoFormat {
+				width,
+				height,
+				chroma: if args.yuv444 {
+					pyrowave::ChromaSampling::Yuv444
+				} else {
+					pyrowave::ChromaSampling::Yuv420
+				},
+			},
+			fps: target_fps,
+			dump: args.dump_frame.clone(),
+		});
+		match decode_check::DecodeCheck::start(ping_addr, pyrowave) {
+			Ok(check) => Some(check),
+			Err(error) => {
+				let _ = session_manager.stop_session().await;
+				return Err(error.into());
+			},
+		}
+	} else {
+		if let Ok(ping_sock) = UdpSocket::bind("127.0.0.1:0") {
+			let _ = ping_sock.send_to(b"PING", ping_addr);
+			tracing::debug!("Sent PING to video socket at {ping_addr}");
+		}
+		None
+	};
 
 	tracing::info!("Session active. Collecting stats...");
 
@@ -739,9 +776,21 @@ async fn run_benchmark(
 		total.print_summary("Session")
 	};
 
+	let check_result = decode_check.map(|check| check.finish());
 	tracing::info!("Stopping session...");
 	let _ = session_manager.stop_session().await;
 
+	if !interrupted && let Some(result) = check_result {
+		let report = result?;
+		tracing::info!(
+			"Decode check [{} frames expected, {} complete, {} of {} sampled frames decoded]",
+			report.received,
+			report.complete,
+			report.decoded,
+			report.decode_attempts
+		);
+		report.validate(video_format == VideoFormat::PyroWave)?;
+	}
 	tracing::info!("Done.");
 	Ok(BenchmarkReport {
 		resolution_label,

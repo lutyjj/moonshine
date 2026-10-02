@@ -36,7 +36,17 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--hdr` | off | Enable HDR mode |
 | `--yuv444` | off | Encode with full chroma resolution (4:4:4) |
 | `--capture-on-commit` | off | Capture frames when the application presents them instead of on the refresh tick |
+| `--decode-check` | off | Check data-shard completeness over loopback and decode sampled PyroWave frames |
+| `--dump-frame <FILE>` | none | Write the last frame the decode check decoded to a Y4M file (PyroWave only) |
 | `--verbose` | off | Print per-frame stats instead of periodic summary |
+
+The decode check fails on missing interior frames or data shards, worker errors,
+and unsuccessful sampled decodes. Partial frames at connection and shutdown are
+excluded. PyroWave runs must decode at least one sample. The check does not recover
+lost shards using FEC or validate every field used by Moonlight.
+
+Frame dumps use the decoder's eight-bit CPU readback. HDR dumps contain untagged PQ
+values; they do not verify display brightness or color accuracy.
 
 ### Examples
 
