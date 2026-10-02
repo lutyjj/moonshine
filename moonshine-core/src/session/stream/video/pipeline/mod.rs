@@ -233,11 +233,12 @@ impl FrameContext {
 	}
 }
 
+#[derive(Clone)]
 struct EncodedFrame {
 	data: Bytes,
 	pts: u64,
 	is_key_frame: bool,
-	first_packet_extra_flags: u8,
+	record_layout: Option<Arc<super::pyrowave_framing::RecordLayout>>,
 }
 
 /// Message from the encoding thread to the packet consumer thread, in
@@ -346,7 +347,7 @@ async fn run_packet_consumer(
 					data: Bytes::from(packet.data),
 					pts: packet.pts,
 					is_key_frame: packet.is_key_frame,
-					first_packet_extra_flags: 0,
+					record_layout: None,
 				}
 			},
 			PendingFrame::Ready(frame) => frame,
@@ -367,18 +368,31 @@ async fn run_packet_consumer(
 		let processing_latency = t_start.duration_since(frame_context.created_at);
 		let latency_100us = (processing_latency.as_micros() / 100).min(u16::MAX as u128) as u16;
 
-		let shards = packetizer.packetize(
-			&frame.data,
-			is_key_frame,
-			frame.first_packet_extra_flags,
-			ctx.packet_size,
-			ctx.minimum_fec_packets,
-			config.fec_percentage,
-			frame_number,
-			&mut sequence_number,
-			rtp_timestamp,
-			latency_100us,
-		);
+		let shards = if let Some(layout) = &frame.record_layout {
+			packetizer.packetize_pyrowave(
+				&frame.data,
+				layout,
+				ctx.packet_size,
+				config.fec_percentage,
+				ctx.minimum_fec_packets,
+				frame_number,
+				&mut sequence_number,
+				rtp_timestamp,
+				latency_100us,
+			)
+		} else {
+			packetizer.packetize(
+				&frame.data,
+				is_key_frame,
+				ctx.packet_size,
+				ctx.minimum_fec_packets,
+				config.fec_percentage,
+				frame_number,
+				&mut sequence_number,
+				rtp_timestamp,
+				latency_100us,
+			)
+		};
 		let shards = match shards {
 			Ok(shards) => shards,
 			// Drop just this frame rather than tearing down the session: the
@@ -1295,7 +1309,7 @@ mod tests {
 				data: Bytes::from_static(&[0x42; 100]),
 				pts,
 				is_key_frame: true,
-				first_packet_extra_flags: 0x80,
+				record_layout: None,
 			}),
 		)
 	}
