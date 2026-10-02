@@ -8,8 +8,8 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 ## Features
 
 - **Isolated streaming sessions**: Each stream runs in its own compositor, completely separate from your desktop environment. Your host PC can still be used for other things while you stream.
-- **No monitor required**: Works on headless servers — no HDMI dummy plug needed.
-- **Hardware video encoding**: H.264, H.265, and AV1 encoding using the GPU.
+- **No monitor required**: Works on headless servers without an HDMI dummy plug.
+- **GPU video encoding**: H.264, H.265, AV1, and PyroWave. PyroWave requires a compatible Moonlight client and full-range video.
 - **HDR support**: True 10-bit HDR streaming for supported games.
 - **Full input support**: Mouse, keyboard, touchscreen, pen/stylus, and gamepad (including motion, touchpad, and haptics).
 - **Audio streaming**: Stereo and surround sound (5.1/7.1) with low-latency Opus encoding.
@@ -18,7 +18,7 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 
 1. **Linux only**. Available as `.deb`, `.rpm`, Nix, AUR, and an install script for SteamOS. Tested on Arch Linux, but reported to work on other distributions too.
 1. **systemd**. Required for launching and managing application processes. Almost all modern Linux distributions include it by default.
-1. **A GPU with Vulkan video encoding**. NVIDIA RTX, AMD RDNA2+, or Intel Arc.
+1. **A compatible Vulkan GPU**. H.264, H.265, and AV1 require Vulkan video encoding. PyroWave uses Vulkan compute.
 1. **Moonlight v6.0.0 or higher**. Compatibility with older versions or unofficial ports is not guaranteed.
 
 ## Installation
@@ -117,7 +117,7 @@ These steps apply to every installation method above (the service is a systemd u
    ```sh
    sudo usermod -aG input $USER
    ```
-   Moonshine creates a virtual gamepad per streamed controller, and the streamed game must be able to read it. When streaming while a desktop session is active, your user is already granted access to input devices as the active seat, so this step is not needed there. Run `moonshine healthcheck` to verify — it reports an `input group` warning if the group is missing.
+   Moonshine creates a virtual gamepad per streamed controller, and the streamed game must be able to read it. When streaming while a desktop session is active, your user is already granted access to input devices as the active seat, so this step is not needed there. Run `moonshine healthcheck` to verify; it reports an `input group` warning if the group is missing.
 
 ### Source
 
@@ -129,6 +129,7 @@ sudo pacman -S --asdeps \
    clang \
    cmake \
    jq \
+   patch \
    libc++ \
    rust
 
@@ -202,9 +203,9 @@ steam_integration = true
 - `title`: The name shown in Moonlight.
 - `boxart` (optional): Path to a cover image.
 - `command`: The command to run. First entry is the executable, the rest are arguments.
-- `pre_command` (optional): Commands to run before launching the application. Each entry is a separate command, executed in order. Runs synchronously — the session waits for all to finish.
+- `pre_command` (optional): Commands to run before launching the application. Each entry is a separate command, executed in order. The session waits for all commands to finish.
 - `steam_integration` (optional): Steam integration, as gamescope's `-e`; off by default. Turn it on for Steam (Big Picture), so its overlay and focus work. With it on, only Steam and Steam game windows can take focus, so leave it off for anything launched directly. Games from the Steam application scanner have it on.
-- `post_command` (optional): Commands to run after the streaming session ends. Each entry is a separate command, executed in order. Runs synchronously — the server waits for all to finish.
+- `post_command` (optional): Commands to run after the streaming session ends. Each entry is a separate command, executed in order. The server waits for all commands to finish.
 
 Example:
 
@@ -225,7 +226,7 @@ post_command = [
 
 Scanners automatically detect installed applications so you don't have to add them manually.
 
-**Steam scanner** — finds all installed Steam games:
+**Steam scanner** finds all installed Steam games:
 
 ```toml
 [[application_scanner]]
@@ -234,7 +235,7 @@ library = "$HOME/.local/share/Steam"
 command = ["/usr/bin/steam", "-bigpicture", "steam://rungameid/{game_id}"]
 ```
 
-**Desktop scanner** — finds applications from `.desktop` files:
+**Desktop scanner** finds applications from `.desktop` files:
 
 ```toml
 [[application_scanner]]
@@ -247,7 +248,7 @@ include_terminal = false
 resolve_icons = true
 ```
 
-**Lutris scanner** — finds all installed Lutris games:
+**Lutris scanner** finds all installed Lutris games:
 
 ```toml
 [[application_scanner]]
@@ -260,7 +261,7 @@ Box art is automatically loaded from Lutris's `coverart/` directory when availab
 The default database path is `~/.local/share/lutris/pga.db`.
 You can override it with the `pga_db` option to point at a custom database location.
 
-**Heroic scanner** — finds all installed [Heroic Games Launcher](https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher) games (Epic, GOG, Amazon and manually added games):
+**Heroic scanner** finds all installed [Heroic Games Launcher](https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher) games (Epic, GOG, Amazon and manually added games):
 
 ```toml
 [[application_scanner]]

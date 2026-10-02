@@ -317,12 +317,14 @@ fn leb128_decode(data: &[u8]) -> (u64, usize) {
 /// Inject HDR metadata into an encoded bitstream for a key frame.
 ///
 /// Returns a new bitstream with MDCV and CLLI metadata prepended before
-/// the first VCL NAL unit (H.264/H.265) or frame OBU (AV1).
+/// the first VCL NAL unit (H.264/H.265) or frame OBU (AV1). PyroWave has no
+/// in-band metadata: its HDR state travels only on the control stream.
 pub(crate) fn inject_hdr_metadata(data: &[u8], metadata: &HdrMetadata, format: VideoFormat) -> Vec<u8> {
 	match format {
 		VideoFormat::H264 => inject_h264_sei(data, metadata),
 		VideoFormat::Hevc => inject_h265_sei(data, metadata),
 		VideoFormat::Av1 => inject_av1_metadata(data, metadata),
+		VideoFormat::PyroWave => data.to_vec(),
 	}
 }
 
