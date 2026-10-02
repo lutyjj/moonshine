@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::session::SessionKeysReceiver;
 use crate::session::compositor::CompositorFrames;
@@ -12,15 +12,24 @@ use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::{StartSignal, StartWaiter};
 
 mod gso_socket;
+mod pacer;
 mod packetizer;
 mod pipeline;
 mod pyrowave_framing;
 mod shard_batch;
 use gso_socket::UdpGsoSocket;
+use pacer::Pacer;
 pub(crate) use pipeline::KcmpProbe;
 use pipeline::VideoPipeline;
 pub(crate) use pipeline::probe_pyrowave;
 use shard_batch::ShardBatch;
+
+struct PacketBatch {
+	/// Reset epoch the shards were packetized in.
+	epoch: u32,
+	shards: ShardBatch,
+	sent: oneshot::Sender<Option<std::time::Instant>>,
+}
 
 /// Configuration for the video stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -54,6 +63,15 @@ pub struct VideoStreamConfig {
 	/// and 8-byte UDP headers and the 16-byte stream overhead).
 	#[serde(default)]
 	pub max_packet_size: usize,
+
+	/// Rate at which a frame's packets are sent, in megabits per second.
+	///
+	/// A frame that left as one burst can overrun the queue of a slower link
+	/// on the way or the client's receive buffer, so its packets are spread
+	/// out at this rate. `0` disables pacing. Set a rate below the slowest
+	/// link on the path, allowing room for packet headers and FEC.
+	#[serde(default)]
+	pub send_rate_mbps: u32,
 }
 
 /// Smallest accepted packet size cap. Lower values would leave almost no room
@@ -89,6 +107,7 @@ impl Default for VideoStreamConfig {
 			encrypt: false,
 			log_frame_spikes: false,
 			max_packet_size: 0,
+			send_rate_mbps: 0,
 		}
 	}
 }
@@ -353,12 +372,13 @@ impl VideoStream {
 		let resume_pending = Arc::new(AtomicBool::new(false));
 
 		// Packet channel.
-		let (packet_tx, packet_rx) = mpsc::channel::<(u32, ShardBatch)>(128);
+		let (packet_tx, packet_rx) = mpsc::channel::<PacketBatch>(1);
 
 		// Spawn packet handler — gated behind start.
 		spawn_handle_video_packets(
 			packet_rx,
 			socket,
+			Pacer::new(config.send_rate_mbps),
 			start.waiter(),
 			reset_tx.clone(),
 			resume_pending.clone(),
@@ -393,8 +413,9 @@ impl VideoStream {
 }
 
 fn spawn_handle_video_packets(
-	mut packet_rx: mpsc::Receiver<(u32, ShardBatch)>,
+	mut packet_rx: mpsc::Receiver<PacketBatch>,
 	socket: UdpGsoSocket,
+	mut pacer: Pacer,
 	mut start: StartWaiter,
 	reset_tx: broadcast::Sender<u32>,
 	resume_pending: Arc<AtomicBool>,
@@ -420,18 +441,19 @@ fn spawn_handle_video_packets(
 			tokio::select! {
 				batch = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
 					match batch {
-						Ok(Some((epoch, batch))) => {
+						Ok(Some(PacketBatch { epoch, shards, sent })) => {
 							if let Some(addr) = client_address {
 								// Frames from before a resume's reset would reach the new client
 								// with old frame numbers, making it drop the reset frames as stale.
-								if epoch < reset_epoch || batch.shard_count() == 0 {
+								if epoch < reset_epoch || shards.shard_count() == 0 {
+									let _ = sent.send(None);
 									continue;
 								}
 
 								// Sends are wrapped in wrap_cancel so a socket that
 								// stops draining cannot block session shutdown.
 								match stop_session_manager
-									.wrap_cancel(socket.send_batch(&batch, addr))
+									.wrap_cancel(socket.send_batch(&shards, addr, &mut pacer))
 									.await
 								{
 									Ok(failed_chunks) => {
@@ -447,6 +469,10 @@ fn spawn_handle_video_packets(
 									},
 									Err(_) => break,
 								}
+
+								let _ = sent.send(Some(std::time::Instant::now()));
+							} else {
+								let _ = sent.send(None);
 							}
 						},
 						Ok(None) => {
@@ -502,6 +528,7 @@ mod tests {
 		spawn_handle_video_packets(
 			packet_rx,
 			socket,
+			Pacer::new(0),
 			start.waiter(),
 			reset_tx,
 			Arc::new(AtomicBool::new(false)),

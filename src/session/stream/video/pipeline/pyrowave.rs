@@ -30,9 +30,9 @@ use super::{
 use crate::session::compositor::CompositorFrames;
 use crate::session::compositor::frame::{FrameColorSpace, HdrModeState, color_space, hdr_metadata};
 use crate::session::manager::SessionShutdownReason;
+use crate::session::stream::video::PacketBatch;
 use crate::session::stream::video::packetizer::{NV_VIDEO_PACKET_SIZE, Packetizer};
 use crate::session::stream::video::pyrowave_framing;
-use crate::session::stream::video::shard_batch::ShardBatch;
 use crate::session::stream::video::{FrameStats, VideoChromaSampling, VideoDynamicRange, VideoStreamContext};
 
 struct Import {
@@ -215,7 +215,7 @@ impl VideoPipelineInner {
 		&self,
 		runtime: tokio::runtime::Handle,
 		frames: CompositorFrames,
-		packet_tx: mpsc::Sender<(u32, ShardBatch)>,
+		packet_tx: mpsc::Sender<PacketBatch>,
 		idr_tx: broadcast::Sender<()>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		mut reset_request_rx: broadcast::Receiver<u32>,
