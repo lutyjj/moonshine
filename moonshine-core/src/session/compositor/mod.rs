@@ -102,6 +102,16 @@ pub struct CompositorConfig {
 
 	/// Keyboard configuration for the compositor's XKB state.
 	pub keyboard: KeyboardConfig,
+
+	/// Send a fullscreen application's frame to the encoder when it is
+	/// presented instead of on the next refresh tick.
+	///
+	/// The tick captures a frame up to one refresh interval after the
+	/// application presented it. Capturing on commit removes that wait, at the
+	/// cost of frames leaving at the application's cadence rather than on a
+	/// fixed grid. The application is still paced at the refresh rate. Only
+	/// frames that need no compositing are captured this way.
+	pub capture_on_commit: bool,
 }
 
 impl Default for CompositorConfig {
@@ -112,6 +122,7 @@ impl Default for CompositorConfig {
 			steam_mode: true,
 			virtual_connector_strategy: VirtualConnectorStrategy::SingleApplication,
 			keyboard: KeyboardConfig::default(),
+			capture_on_commit: false,
 		}
 	}
 }
@@ -413,6 +424,7 @@ fn run_compositor(
 		config.steam_mode,
 		config.virtual_connector_strategy,
 		config.keyboard.clone(),
+		config.capture_on_commit,
 	);
 
 	// Insert the Wayland display as a calloop event source so client
