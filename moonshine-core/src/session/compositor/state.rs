@@ -27,6 +27,7 @@ use smithay::desktop::utils::send_frames_surface_tree;
 use smithay::desktop::utils::{OutputPresentationFeedback, take_presentation_feedback_surface_tree};
 use std::collections::HashMap;
 
+use smithay::backend::drm::DrmDeviceFd;
 use smithay::backend::input::InputTime;
 use smithay::desktop::Space;
 use smithay::input::keyboard::XkbConfig;
@@ -39,10 +40,11 @@ use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
 use smithay::reexports::wayland_server::backend::ClientData;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
-use smithay::utils::{Clock, IsAlive, Logical, Monotonic, Point};
+use smithay::utils::{Clock, DeviceFd, IsAlive, Logical, Monotonic, Point};
 use smithay::wayland::compositor;
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
 use smithay::wayland::dmabuf::{self, DmabufFeedbackBuilder, DmabufGlobal, DmabufState};
+use smithay::wayland::drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::pointer_constraints::PointerConstraintsState;
 use smithay::wayland::presentation::Refresh;
@@ -269,6 +271,10 @@ pub(crate) struct MoonshineCompositor {
 	// -- DMA-BUF --
 	pub dmabuf_state: DmabufState,
 	pub dmabuf_global: DmabufGlobal,
+	/// Explicit sync (`linux-drm-syncobj-v1`), when the render node supports it.
+	pub syncobj_state: Option<DrmSyncobjState>,
+	/// The surface and event source of each commit waiting for an acquire point.
+	pub acquire_waits: Vec<(WlSurface, RegistrationToken)>,
 
 	// -- Frame relay to encoder --
 	pub frame_tx: mpsc::SyncSender<ExportedFrame>,
@@ -553,6 +559,7 @@ impl MoonshineCompositor {
 		virtual_connector_strategy: super::VirtualConnectorStrategy,
 		keyboard_config: KeyboardConfig,
 		capture_on_commit: bool,
+		explicit_sync: bool,
 	) -> (Self, Display<Self>) {
 		let compositor_state = CompositorState::new_v6::<Self>(&display_handle);
 		let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
@@ -650,6 +657,16 @@ impl MoonshineCompositor {
 			.build()
 			.expect("Failed to build DmabufFeedback");
 
+		// Explicit sync needs a kernel that can report a timeline point through an eventfd.
+		let syncobj_state = explicit_sync
+			.then(|| std::fs::OpenOptions::new().read(true).write(true).open(render_node))
+			.and_then(Result::ok)
+			.map(|node| DrmDeviceFd::new(DeviceFd::from(std::os::fd::OwnedFd::from(node))))
+			.filter(supports_syncobj_eventfd)
+			.map(|device| DrmSyncobjState::new::<Self>(&display_handle, device));
+		if explicit_sync && syncobj_state.is_none() {
+			tracing::warn!("Explicit sync is not available on {}.", render_node.display());
+		}
 		let mut dmabuf_state = DmabufState::new();
 		let dmabuf_global =
 			dmabuf_state.create_global_with_default_feedback::<Self>(&display_handle, &default_feedback);
@@ -706,6 +723,8 @@ impl MoonshineCompositor {
 				renderer,
 				dmabuf_state,
 				dmabuf_global,
+				syncobj_state,
+				acquire_waits: Vec::new(),
 				frame_tx,
 				seat,
 				pending_text: String::new(),

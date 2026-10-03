@@ -27,6 +27,7 @@ use smithay::wayland::compositor::{
 	CompositorClientState, CompositorHandler, CompositorState, add_pre_commit_hook, is_sync_subsurface,
 };
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
+use smithay::wayland::drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState};
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::pointer_constraints::{ConstraintRemove, PointerConstraintsHandler, with_pointer_constraint};
 use smithay::wayland::selection::SelectionHandler;
@@ -455,6 +456,7 @@ impl CompositorHandler for MoonshineCompositor {
 
 	fn destroyed(&mut self, surface: &WlSurface) {
 		tracing::debug!(surface_id = ?surface.id(), "surface destroyed");
+		held_commits::surface_destroyed(self, surface);
 		if let Some(cm) = &mut self.color_management {
 			cm.surface_destroyed(surface);
 		}
@@ -2719,6 +2721,12 @@ impl XwmHandler for MoonshineCompositor {
 
 	fn move_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32) {
 		// Interactive move not needed for headless compositor.
+	}
+}
+
+impl DrmSyncobjHandler for MoonshineCompositor {
+	fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
+		self.syncobj_state.as_mut()
 	}
 }
 

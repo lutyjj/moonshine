@@ -6,12 +6,17 @@
 //! until they have signaled, so a frame is only captured once the client has
 //! finished drawing it.
 //!
+//! With explicit sync (`linux-drm-syncobj-v1`) the client names the point at
+//! which its rendering finishes, and the commit is held on that point instead.
+//!
 //! Fences added after the commit are left out on purpose. Drivers attach them
 //! for later work that never touches the committed frame (amdgpu marks every
 //! buffer a submission lists as written), so following the buffer's live state
 //! holds a commit long after its own rendering finished.
 
+use std::cell::Cell;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::rc::Rc;
 
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, Mode, PostAction};
@@ -21,20 +26,34 @@ use smithay::wayland::compositor::{
 	Barrier, BufferAssignment, CompositorHandler, SurfaceAttributes, add_blocker, with_states,
 };
 use smithay::wayland::dmabuf::get_dmabuf;
+use smithay::wayland::drm_syncobj::{DrmSyncPoint, DrmSyncobjCachedState};
 
 use crate::session::compositor::state::MoonshineCompositor;
 
 /// Pre-commit hook: hold the commit until its buffer is rendered.
 pub(crate) fn hold_until_rendered(state: &mut MoonshineCompositor, _: &DisplayHandle, surface: &WlSurface) {
-	let dmabuf = with_states(surface, |states| {
-		match states.cached_state.get::<SurfaceAttributes>().pending().buffer.as_ref() {
+	let (dmabuf, acquire_point) = with_states(surface, |states| {
+		let dmabuf = match states.cached_state.get::<SurfaceAttributes>().pending().buffer.as_ref() {
 			Some(BufferAssignment::NewBuffer(buffer)) => get_dmabuf(buffer).ok().cloned(),
 			_ => None,
-		}
+		};
+		let acquire_point = states
+			.cached_state
+			.get::<DrmSyncobjCachedState>()
+			.pending()
+			.acquire_point
+			.clone();
+		(dmabuf, acquire_point)
 	});
 	let Some(dmabuf) = dmabuf else {
 		return;
 	};
+
+	// If the wait for an acquire point cannot be set up, the fence snapshot is
+	// the next best thing: the protocol has no way to refuse a commit.
+	if acquire_point.is_some_and(|point| hold_until_acquired(state, surface, &point)) {
+		return;
+	}
 
 	// One blocker for each plane still being written; the commit applies once
 	// all of them are released.
@@ -53,6 +72,53 @@ pub(crate) fn hold_until_rendered(state: &mut MoonshineCompositor, _: &DisplayHa
 			add_blocker(surface, blocker);
 		}
 	}
+}
+
+/// Hold a commit until its explicit-sync acquire point signals. Returns
+/// `false` if the wait could not be set up.
+fn hold_until_acquired(state: &mut MoonshineCompositor, surface: &WlSurface, point: &DrmSyncPoint) -> bool {
+	// A frame that is already finished needs no wait, as in KWin and Mutter.
+	if point.wait(0).is_ok() {
+		return true;
+	}
+	let (blocker, source) = match point.generate_blocker() {
+		Ok(wait) => wait,
+		Err(error) => {
+			tracing::warn!("Failed to wait for an explicit-sync acquire point: {error}");
+			return false;
+		},
+	};
+	let held = surface.clone();
+	let registered = Rc::new(Cell::new(None));
+	let own = registered.clone();
+	let inserted = state.handle.insert_source(source, move |_, _, state| {
+		state.acquire_waits.retain(|(_, token)| Some(*token) != own.get());
+		release(state, &held);
+		Ok(())
+	});
+	match inserted {
+		Ok(token) => {
+			registered.set(Some(token));
+			state.acquire_waits.push((surface.clone(), token));
+			add_blocker(surface, blocker);
+			true
+		},
+		Err(error) => {
+			tracing::warn!("Failed to wait for an explicit-sync acquire point: {}", error.error);
+			false
+		},
+	}
+}
+
+/// Drop the surface's waits for acquire points. Such a point may never
+/// signal, so its wait must not outlive the surface.
+pub(crate) fn surface_destroyed(state: &mut MoonshineCompositor, surface: &WlSurface) {
+	state.acquire_waits.retain(|(waiting, token)| {
+		if waiting == surface {
+			state.handle.remove(*token);
+		}
+		waiting != surface
+	});
 }
 
 /// Apply a commit whose blocker has cleared.

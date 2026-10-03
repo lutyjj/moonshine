@@ -115,6 +115,15 @@ pub struct CompositorConfig {
 	/// refresh rate. Only frames that need no compositing are captured this
 	/// way.
 	pub capture_on_commit: bool,
+
+	/// Offer explicit sync (`linux-drm-syncobj-v1`) to applications.
+	///
+	/// An application that uses it names the point at which a frame is fully
+	/// rendered, and the compositor waits for exactly that. Off by default,
+	/// because drivers behave differently once it is offered: NVIDIA's no
+	/// longer waits for the frame before it commits, so an application that
+	/// renders as fast as it can queues more frames ahead.
+	pub explicit_sync: bool,
 }
 
 impl Default for CompositorConfig {
@@ -126,6 +135,7 @@ impl Default for CompositorConfig {
 			virtual_connector_strategy: VirtualConnectorStrategy::SingleApplication,
 			keyboard: KeyboardConfig::default(),
 			capture_on_commit: false,
+			explicit_sync: false,
 		}
 	}
 }
@@ -428,6 +438,7 @@ fn run_compositor(
 		config.virtual_connector_strategy,
 		config.keyboard.clone(),
 		config.capture_on_commit,
+		config.explicit_sync,
 	);
 
 	// Insert the Wayland display as a calloop event source so client

@@ -38,6 +38,7 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--capture-on-commit` | off | Capture frames when the application presents them instead of on the refresh tick |
 | `--decode-check` | off | Check data-shard completeness over loopback and decode sampled PyroWave frames |
 | `--dump-frame <FILE>` | none | Write the last frame the decode check decoded to a Y4M file (PyroWave only) |
+| `--explicit-sync` | off | Offer explicit sync (`compositor.explicit_sync`) to the application |
 | `--verbose` | off | Print per-frame stats instead of periodic summary |
 
 The decode check fails on missing interior frames or data shards, worker errors,

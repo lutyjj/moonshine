@@ -84,6 +84,10 @@ struct Args {
 	#[arg(long, value_name = "FILE")]
 	dump_frame: Option<PathBuf>,
 
+	/// Offer explicit sync to the application.
+	#[arg(long)]
+	explicit_sync: bool,
+
 	/// Print per-frame stats to stderr instead of periodic summary.
 	#[arg(long)]
 	verbose: bool,
@@ -558,6 +562,7 @@ async fn run_benchmark(
 	let session_manager = SessionManager::new(
 		CompositorConfig {
 			capture_on_commit: args.capture_on_commit,
+			explicit_sync: args.explicit_sync,
 			..Default::default()
 		},
 		VideoStreamConfig::default(),
