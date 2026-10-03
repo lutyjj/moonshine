@@ -297,6 +297,7 @@ pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const Vk
 		if let Some(arc) = wayland_arc {
 			let mut wl = arc.force_lock();
 			if !wl.dead {
+				wl.read_events();
 				wl.dispatch_pending();
 
 				// Extract VkPresentTimesInfoGOOGLE from pNext chain.

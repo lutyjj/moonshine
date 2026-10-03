@@ -52,6 +52,7 @@ impl<T> RwLockExt<T> for RwLock<T> {
 	}
 }
 
+use wayland_client::backend::WaylandError;
 use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_registry::WlRegistry;
@@ -304,6 +305,30 @@ pub struct WaylandConnection {
 }
 
 impl WaylandConnection {
+	/// Read the events the compositor has sent, without blocking.
+	/// Returns `false` if the connection is dead.
+	///
+	/// Only for the layer's own connection. The driver's WSI reads it while
+	/// waiting for a buffer release, and with explicit sync it never waits, so
+	/// unread events would pile up until the compositor drops the client.
+	pub fn read_events(&mut self) -> bool {
+		if self.dead {
+			return false;
+		}
+		let Some(guard) = self.connection.prepare_read() else {
+			return true; // Events are already queued for dispatch.
+		};
+		match guard.read() {
+			Ok(_) => true,
+			Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+			Err(e) => {
+				crate::log_warn!("Wayland read error: {e}");
+				self.dead = true;
+				false
+			},
+		}
+	}
+
 	/// Dispatch any pending Wayland events without blocking.
 	/// Returns `false` if the connection is dead.
 	pub fn dispatch_pending(&mut self) -> bool {
