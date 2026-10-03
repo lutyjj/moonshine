@@ -73,6 +73,15 @@ pub(crate) struct GbmBufferSlot {
 	consumed: Arc<AtomicBool>,
 }
 
+struct ScanoutPresentation {
+	surface: WlSurface,
+	window: Option<smithay::desktop::Window>,
+	feedback: OutputPresentationFeedback,
+	/// When the frame was exported. With capture on commit that is earlier
+	/// than the tick that reports it.
+	presented_at: smithay::utils::Time<Monotonic>,
+}
+
 struct ScanoutBuffer {
 	consumed: Arc<AtomicBool>,
 	import_failed: Arc<AtomicBool>,
@@ -297,6 +306,17 @@ pub(crate) struct MoonshineCompositor {
 	/// changes without a surface commit.
 	pub last_cursor_position: Point<f64, Logical>,
 
+	// -- Capture on commit --
+	/// Export a scanned-out frame when the client commits it instead of on
+	/// the next timer tick. See [`super::CompositorConfig::capture_on_commit`].
+	pub capture_on_commit: bool,
+	/// Detach the exported commit's feedback before a later commit replaces it.
+	/// Frame callbacks still wait for the refresh tick to pace the client.
+	presented_on_commit: Option<ScanoutPresentation>,
+	/// The commit last scanned out, to tell a new buffer from a commit that
+	/// only changed other surface state.
+	last_scanout_commit: Option<(smithay::reexports::wayland_server::backend::ObjectId, CommitCounter)>,
+
 	// -- Steam overlay z-order --
 	/// True while the Steam overlay window is raised above the game.
 	pub overlay_raised: bool,
@@ -509,6 +529,7 @@ impl MoonshineCompositor {
 		steam_mode: bool,
 		virtual_connector_strategy: super::VirtualConnectorStrategy,
 		keyboard_config: KeyboardConfig,
+		capture_on_commit: bool,
 	) -> (Self, Display<Self>) {
 		let compositor_state = CompositorState::new_v6::<Self>(&display_handle);
 		let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
@@ -687,6 +708,9 @@ impl MoonshineCompositor {
 				last_frame_sent_at: std::time::Instant::now(),
 				overlay_dirty: true,
 				last_cursor_position: Point::from((width as f64 / 2.0, height as f64 / 2.0)),
+				capture_on_commit,
+				presented_on_commit: None,
+				last_scanout_commit: None,
 				overlay_raised: false,
 				overlay_z_x11_window: None,
 				viewporter_state,
@@ -1077,9 +1101,23 @@ impl MoonshineCompositor {
 			}
 		});
 
+		// A frame exported on commit still owes its client the frame callback;
+		// sending it on the tick keeps the client paced at the refresh rate.
+		let presented_on_commit = self.presented_on_commit.take();
+		let captured = presented_on_commit.is_some();
+		if let Some(target) = presented_on_commit {
+			self.notify_presented(target);
+		}
+
 		// Skip rendering when the screen is static and we already sent a
 		// keepalive frame within the last second.
 		if !self.screen_dirty && self.last_frame_sent_at.elapsed() < std::time::Duration::from_secs(1) {
+			return;
+		}
+
+		// Later commits remain dirty for the next capture opportunity;
+		// this tick only delivers callbacks for the on-commit export.
+		if captured {
 			return;
 		}
 
@@ -1096,22 +1134,15 @@ impl MoonshineCompositor {
 		//
 		// Direct scanout bypasses GLES, so skip it while an actually-drawn
 		// cursor (not client-hidden) needs compositing.
-		let pointer_active = self
-			.last_pointer_activity
-			.is_some_and(|t| t.elapsed() <= std::time::Duration::from_secs(3));
-		let cursor_visible = pointer_active && !matches!(self.cursor_status, CursorImageStatus::Hidden);
-		// While a Steam overlay is raised we must composite it together with the
-		// game (gamescope's `paint_all`), so direct scanout — which bypasses the
-		// space — is disabled.
-		let overlay_raised = self.overlay_raised;
-		if !cursor_visible && !overlay_raised {
-			if self.is_override_active() {
-				if self.try_direct_scanout_override() {
-					tracing::trace!("Frame via direct scanout (override path)");
-					return;
-				}
-			} else if self.try_direct_scanout() {
-				tracing::trace!("Frame via direct scanout (not override path)");
+		if self.scanout_allowed() {
+			let target = if self.is_override_active() {
+				self.try_direct_scanout_override(false)
+			} else {
+				self.try_direct_scanout(false)
+			};
+			if let Some(target) = target {
+				tracing::trace!("Frame via direct scanout");
+				self.notify_presented(target);
 				return;
 			}
 		}
@@ -1426,9 +1457,108 @@ impl MoonshineCompositor {
 		}
 	}
 
+	/// Whether a client buffer may go to the encoder as is. An actually-drawn
+	/// cursor (not client-hidden) needs compositing, and so does a raised Steam
+	/// overlay, which is painted together with the game (gamescope's
+	/// `paint_all`).
+	fn scanout_allowed(&self) -> bool {
+		let pointer_active = self
+			.last_pointer_activity
+			.is_some_and(|t| t.elapsed() <= std::time::Duration::from_secs(3));
+		let cursor_visible = pointer_active && !matches!(self.cursor_status, CursorImageStatus::Hidden);
+		!cursor_visible && !self.overlay_raised
+	}
+
+	/// Export the frame `surface` just committed, if it is the one direct
+	/// scanout would pick on the next tick. Its frame callback is left to
+	/// that tick.
+	pub(crate) fn capture_commit(&mut self, surface: &WlSurface) {
+		if !self.capture_on_commit || self.presented_on_commit.is_some() || !self.scanout_allowed() {
+			return;
+		}
+		let commit = with_renderer_surface_state(surface, |state| state.current_commit());
+		if commit.map(|commit| (surface.id(), commit)) == self.last_scanout_commit {
+			return;
+		}
+
+		self.presented_on_commit = if self.is_override_active() {
+			if self.override_surface.as_ref().is_none_or(|(s, _)| s != surface) {
+				return;
+			}
+			self.try_direct_scanout_override(true)
+		} else {
+			let mut windows = self.space.elements();
+			let is_lone_toplevel = matches!(
+				(windows.next(), windows.next()),
+				(Some(window), None) if window.toplevel().is_some_and(|toplevel| toplevel.wl_surface() == surface)
+			);
+			drop(windows);
+			if !is_lone_toplevel {
+				return;
+			}
+			self.try_direct_scanout(true)
+		};
+	}
+
+	fn take_scanout_feedback(&self, surface: &WlSurface) -> OutputPresentationFeedback {
+		let mut feedback = OutputPresentationFeedback::new(&self.output);
+		take_presentation_feedback_surface_tree(
+			surface,
+			&mut feedback,
+			|_, _| Some(self.output.clone()),
+			|_, _| {
+				smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
+			},
+		);
+		feedback
+	}
+
+	fn notify_presented(&mut self, mut capture: ScanoutPresentation) {
+		if let Some(window) = capture.window {
+			window.send_frame(
+				&self.output,
+				self.clock.now(),
+				Some(std::time::Duration::ZERO),
+				|_, _| Some(self.output.clone()),
+			);
+		} else {
+			send_frames_surface_tree(
+				&capture.surface,
+				&self.output,
+				self.clock.now(),
+				Some(std::time::Duration::ZERO),
+				|_, _| Some(self.output.clone()),
+			);
+		}
+
+		let frame_period = self
+			.output
+			.preferred_mode()
+			.map(|m| std::time::Duration::from_nanos(1_000_000_000_000u64 / m.refresh.max(1) as u64))
+			.unwrap_or(std::time::Duration::from_millis(11));
+		capture
+			.feedback
+			.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
+			capture.presented_at,
+			Refresh::Fixed(frame_period),
+			0,
+			smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(
+			),
+		);
+
+		if let Err(e) = self.display_handle.flush_clients() {
+			tracing::error!("Failed to flush clients after scanout: {e}");
+		}
+	}
+
+	fn record_scanout(&mut self, surface: &WlSurface) {
+		self.last_scanout_commit =
+			with_renderer_surface_state(surface, |state| state.current_commit()).map(|commit| (surface.id(), commit));
+	}
+
 	/// Attempt direct DMA-BUF scanout, bypassing compositor rendering.
 	///
-	/// Returns `true` if a frame was successfully exported directly from
+	/// Returns the scanned-out window if a frame was exported directly from
 	/// the client's DMA-BUF, skipping the GBM pool and GL compositing.
 	/// This preserves pixel-exact content (important for HDR/PQ) and
 	/// reduces GPU usage and latency.
@@ -1436,12 +1566,13 @@ impl MoonshineCompositor {
 	/// Conditions for direct scanout:
 	/// - Exactly one window in the compositor space
 	/// - The window's committed buffer is a DMA-BUF (not SHM)
-	fn try_direct_scanout(&mut self) -> bool {
+	// Tick-time drops still owe callbacks; commit-time drops leave the tick eligible.
+	fn try_direct_scanout(&mut self, on_commit: bool) -> Option<ScanoutPresentation> {
 		// Must have exactly one window, no overlapping surfaces.
 		let windows: Vec<_> = self.space.elements().cloned().collect();
 		if windows.len() != 1 {
 			tracing::trace!("Direct scanout: {} windows (need 1)", windows.len());
-			return false;
+			return None;
 		}
 
 		let window = &windows[0];
@@ -1449,7 +1580,7 @@ impl MoonshineCompositor {
 			Some(t) => t,
 			None => {
 				tracing::trace!("Direct scanout: window has no toplevel");
-				return false;
+				return None;
 			},
 		};
 
@@ -1458,7 +1589,7 @@ impl MoonshineCompositor {
 			&& geo.loc != Point::from((0, 0))
 		{
 			tracing::trace!("Direct scanout: window not at origin ({:?})", geo.loc);
-			return false;
+			return None;
 		}
 
 		let wl_surface = toplevel.wl_surface().clone();
@@ -1475,15 +1606,15 @@ impl MoonshineCompositor {
 
 		let Some(Some(buffer)) = scanout_buffer else {
 			tracing::trace!("Direct scanout: no committed buffer");
-			return false;
+			return None;
 		};
 		let Ok(client_dmabuf) = dmabuf::get_dmabuf(&buffer) else {
 			tracing::trace!("Direct scanout: failed to get DMA-BUF from buffer");
-			return false;
+			return None;
 		};
 		let client_dmabuf = client_dmabuf.clone();
 		if self.rejected_scanout_layouts.contains(&scanout_layout(&client_dmabuf)) {
-			return false;
+			return None;
 		}
 
 		// The surface buffer must exactly match the output dimensions with
@@ -1497,7 +1628,7 @@ impl MoonshineCompositor {
 				self.width,
 				self.height,
 			);
-			return false;
+			return None;
 		}
 
 		// Assign a stable buffer index for the encoder's import cache, keyed
@@ -1557,52 +1688,31 @@ impl MoonshineCompositor {
 		match self.frame_tx.try_send(exported_frame) {
 			Err(mpsc::TrySendError::Disconnected(_)) => {
 				tracing::debug!("Frame channel disconnected, compositor stopping.");
+				consumed.store(true, Ordering::Release);
+				if on_commit {
+					return None;
+				}
 			},
 			Err(mpsc::TrySendError::Full(_)) => {
 				consumed.store(true, Ordering::Release);
+				if on_commit {
+					return None;
+				}
 			},
 			Ok(()) => {
+				self.record_scanout(&wl_surface);
 				self.screen_dirty = false;
 				self.last_frame_sent_at = std::time::Instant::now();
 			},
 		}
 
-		// Send frame callbacks to the client.
-		window.send_frame(
-			&self.output,
-			self.clock.now(),
-			Some(std::time::Duration::ZERO),
-			|_, _| Some(self.output.clone()),
-		);
-
-		// Drain and respond to wp_presentation_feedback callbacks.
-		let mut feedback = OutputPresentationFeedback::new(&self.output);
-		take_presentation_feedback_surface_tree(
-			&wl_surface,
-			&mut feedback,
-			|_, _| Some(self.output.clone()),
-			|_, _| {
-				smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
-			},
-		);
-		let frame_period = self
-			.output
-			.preferred_mode()
-			.map(|m| std::time::Duration::from_nanos(1_000_000_000_000u64 / m.refresh.max(1) as u64))
-			.unwrap_or(std::time::Duration::from_millis(11));
-		feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
-			self.clock.now(),
-			Refresh::Fixed(frame_period),
-			0,
-			smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(
-			),
-		);
-
-		if let Err(e) = self.display_handle.flush_clients() {
-			tracing::error!("Failed to flush clients after scanout: {e}");
-		}
-
-		true
+		Some(ScanoutPresentation {
+			// Feedback belongs to this commit; a later commit may replace surface state.
+			feedback: self.take_scanout_feedback(&wl_surface),
+			surface: wl_surface,
+			window: Some(window.clone()),
+			presented_at: self.clock.now(),
+		})
 	}
 
 	/// Direct DMA-BUF scanout for the gamescope/moonshine override surface.
@@ -1615,10 +1725,10 @@ impl MoonshineCompositor {
 	/// latency. This sends the override surface's committed DMA-BUF straight
 	/// to the encoder and delivers frame callbacks to the override surface so
 	/// the WSI layer's `vkQueuePresentKHR` can unblock for the next frame.
-	fn try_direct_scanout_override(&mut self) -> bool {
+	fn try_direct_scanout_override(&mut self, on_commit: bool) -> Option<ScanoutPresentation> {
 		let override_surface = match self.override_surface.as_ref() {
 			Some((s, _)) if s.alive() => s.clone(),
-			_ => return false,
+			_ => return None,
 		};
 
 		let scanout_buffer = with_renderer_surface_state(&override_surface, |state| {
@@ -1631,15 +1741,15 @@ impl MoonshineCompositor {
 		});
 		let Some(Some(buffer)) = scanout_buffer else {
 			tracing::trace!("Override scanout: no committed buffer");
-			return false;
+			return None;
 		};
 		let Ok(client_dmabuf) = dmabuf::get_dmabuf(&buffer) else {
 			tracing::trace!("Override scanout: failed to get DMA-BUF from buffer");
-			return false;
+			return None;
 		};
 		let client_dmabuf = client_dmabuf.clone();
 		if self.rejected_scanout_layouts.contains(&scanout_layout(&client_dmabuf)) {
-			return false;
+			return None;
 		}
 
 		if client_dmabuf.width() != self.width || client_dmabuf.height() != self.height {
@@ -1650,7 +1760,7 @@ impl MoonshineCompositor {
 				self.width,
 				self.height,
 			);
-			return false;
+			return None;
 		}
 
 		let buffer_id = buffer.id();
@@ -1729,54 +1839,31 @@ impl MoonshineCompositor {
 		match self.frame_tx.try_send(exported_frame) {
 			Err(mpsc::TrySendError::Disconnected(_)) => {
 				tracing::debug!("Frame channel disconnected, compositor stopping.");
+				consumed.store(true, Ordering::Release);
+				if on_commit {
+					return None;
+				}
 			},
 			Err(mpsc::TrySendError::Full(_)) => {
 				consumed.store(true, Ordering::Release);
+				if on_commit {
+					return None;
+				}
 			},
 			Ok(()) => {
+				self.record_scanout(&override_surface);
 				self.screen_dirty = false;
 				self.last_frame_sent_at = std::time::Instant::now();
 			},
 		}
 
-		// Frame callbacks must go to the override surface (the game's WSI
-		// layer is waiting on these to unblock vkQueuePresentKHR). Without
-		// this the game would block forever after the first frame.
-		send_frames_surface_tree(
-			&override_surface,
-			&self.output,
-			self.clock.now(),
-			Some(std::time::Duration::ZERO),
-			|_, _| Some(self.output.clone()),
-		);
-
-		let mut feedback = OutputPresentationFeedback::new(&self.output);
-		take_presentation_feedback_surface_tree(
-			&override_surface,
-			&mut feedback,
-			|_, _| Some(self.output.clone()),
-			|_, _| {
-				smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
-			},
-		);
-		let frame_period = self
-			.output
-			.preferred_mode()
-			.map(|m| std::time::Duration::from_nanos(1_000_000_000_000u64 / m.refresh.max(1) as u64))
-			.unwrap_or(std::time::Duration::from_millis(11));
-		feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
-			self.clock.now(),
-			Refresh::Fixed(frame_period),
-			0,
-			smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(
-			),
-		);
-
-		if let Err(e) = self.display_handle.flush_clients() {
-			tracing::error!("Failed to flush clients after override scanout: {e}");
-		}
-
-		true
+		Some(ScanoutPresentation {
+			// Feedback belongs to this commit; a later commit may replace surface state.
+			feedback: self.take_scanout_feedback(&override_surface),
+			surface: override_surface,
+			window: None,
+			presented_at: self.clock.now(),
+		})
 	}
 
 	/// Handle gamescope WSI layer's `override_window_content` request.

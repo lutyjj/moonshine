@@ -442,6 +442,8 @@ impl CompositorHandler for MoonshineCompositor {
 
 		// Handle popup commits.
 		self.popups_commit(surface);
+
+		self.capture_commit(surface);
 	}
 
 	fn destroyed(&mut self, surface: &WlSurface) {

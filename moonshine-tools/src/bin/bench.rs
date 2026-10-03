@@ -66,6 +66,11 @@ struct Args {
 	#[arg(long)]
 	yuv444: bool,
 
+	/// Capture frames when the application presents them instead of on the
+	/// refresh tick.
+	#[arg(long)]
+	capture_on_commit: bool,
+
 	/// Print per-frame stats to stderr instead of periodic summary.
 	#[arg(long)]
 	verbose: bool,
@@ -538,7 +543,10 @@ async fn run_benchmark(
 
 	let shutdown = ShutdownManager::<ShutdownReason>::new();
 	let session_manager = SessionManager::new(
-		CompositorConfig::default(),
+		CompositorConfig {
+			capture_on_commit: args.capture_on_commit,
+			..Default::default()
+		},
 		VideoStreamConfig::default(),
 		AudioStreamConfig { port: 0 },
 		ControlStreamConfig {

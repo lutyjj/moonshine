@@ -166,6 +166,20 @@ cargo run --release -- /path/to/config.toml
 A configuration file is created automatically if the path you provide doesn't exist.
 When using the AUR package, it defaults to `$XDG_CONFIG_HOME/moonshine/config.toml`.
 
+### Stream options
+
+PyroWave protects coarse image data with `stream.video.fec_percentage`; lost fine
+records reduce detail within that frame. A compatible Moonlight client is required.
+
+`stream.video.send_rate_mbps` caps packet transmission, including headers and FEC.
+It defaults to `0` (disabled). If bursts cause loss, set it below the slowest link's
+rate. The stream's on-wire bitrate must fit within that rate; otherwise capture
+backpressure drops frames to keep latency bounded.
+
+`compositor.capture_on_commit` defaults to `false`. Enable it to capture eligible
+direct buffers when the application commits them, while keeping frame callbacks
+paced by the refresh tick. Frames requiring composition still use the tick.
+
 ### Pairing with a client
 
 When you connect with Moonlight for the first time, it will show a PIN.

@@ -35,6 +35,7 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--warmup <N>` | `4` | Seconds to discard before recording stats |
 | `--hdr` | off | Enable HDR mode |
 | `--yuv444` | off | Encode with full chroma resolution (4:4:4) |
+| `--capture-on-commit` | off | Capture frames when the application presents them instead of on the refresh tick |
 | `--verbose` | off | Print per-frame stats instead of periodic summary |
 
 ### Examples
