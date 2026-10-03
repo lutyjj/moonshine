@@ -103,6 +103,15 @@ pub struct CompositorConfig {
 
 	/// Keyboard configuration for the compositor's XKB state.
 	pub keyboard: KeyboardConfig,
+
+	/// Offer explicit sync (`linux-drm-syncobj-v1`) to applications.
+	///
+	/// An application that uses it names the point at which a frame is fully
+	/// rendered, and the compositor waits for exactly that. Off by default,
+	/// because drivers behave differently once it is offered: NVIDIA's no
+	/// longer waits for the frame before it commits, so an application that
+	/// renders as fast as it can queues more frames ahead.
+	pub explicit_sync: bool,
 }
 
 impl Default for CompositorConfig {
@@ -113,6 +122,7 @@ impl Default for CompositorConfig {
 			steam_mode: true,
 			virtual_connector_strategy: VirtualConnectorStrategy::SingleApplication,
 			keyboard: KeyboardConfig::default(),
+			explicit_sync: false,
 		}
 	}
 }
@@ -417,6 +427,7 @@ fn run_compositor(
 		config.steam_mode,
 		config.virtual_connector_strategy,
 		config.keyboard.clone(),
+		config.explicit_sync,
 	);
 
 	// Insert the Wayland display as a calloop event source so client

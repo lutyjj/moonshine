@@ -62,6 +62,10 @@ struct Args {
 	#[arg(long)]
 	hdr: bool,
 
+	/// Offer explicit sync to the application.
+	#[arg(long)]
+	explicit_sync: bool,
+
 	/// Print per-frame stats to stderr instead of periodic summary.
 	#[arg(long)]
 	verbose: bool,
@@ -533,7 +537,10 @@ async fn run_benchmark(
 
 	let shutdown = ShutdownManager::<ShutdownReason>::new();
 	let session_manager = SessionManager::new(
-		CompositorConfig::default(),
+		CompositorConfig {
+			explicit_sync: args.explicit_sync,
+			..Default::default()
+		},
 		VideoStreamConfig::default(),
 		AudioStreamConfig { port: 0 },
 		ControlStreamConfig {

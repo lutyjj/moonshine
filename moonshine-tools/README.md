@@ -34,6 +34,7 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--duration <N>` | `0` | Seconds to run before stopping (`0` = run until Ctrl+C) |
 | `--warmup <N>` | `4` | Seconds to discard before recording stats |
 | `--hdr` | off | Enable HDR mode |
+| `--explicit-sync` | off | Offer explicit sync (`compositor.explicit_sync`) to the application |
 | `--verbose` | off | Print per-frame stats instead of periodic summary |
 
 ### Examples
