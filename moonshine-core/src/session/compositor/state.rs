@@ -34,6 +34,7 @@ use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::input::tablet::{TabletDescriptor, TabletSeatTrait};
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
 use smithay::reexports::wayland_server::backend::ClientData;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -94,6 +95,25 @@ fn scanout_layout(dmabuf: &Dmabuf) -> (u32, u64, usize) {
 		dmabuf.format().modifier.into(),
 		dmabuf.num_planes(),
 	)
+}
+
+fn refresh_interval(output: &Output) -> std::time::Duration {
+	output
+		.preferred_mode()
+		.map(|m| std::time::Duration::from_nanos(1_000_000_000_000u64 / m.refresh.max(1) as u64))
+		.unwrap_or(std::time::Duration::from_millis(11))
+}
+
+/// The shortest time between a frame and the next one exported on commit:
+/// 29/30 of the refresh interval.
+///
+/// The missing 1/30 lets an export that was postponed move back towards its
+/// commit. With a full interval it stays late for good, and an application
+/// running at exactly the refresh rate ends up a whole interval behind.
+/// Clients leave the same headroom below their display's maximum (116 fps on
+/// 120 Hz), so frames this far apart still fit the display.
+fn commit_export_interval(output: &Output) -> std::time::Duration {
+	refresh_interval(output) * 29 / 30
 }
 
 // Combined render element type for compositing space + cursor elements.
@@ -313,6 +333,9 @@ pub(crate) struct MoonshineCompositor {
 	/// Detach the exported commit's feedback before a later commit replaces it.
 	/// Frame callbacks still wait for the refresh tick to pace the client.
 	presented_on_commit: Option<ScanoutPresentation>,
+	/// A timer is set to export a commit that came too soon after the
+	/// previous frame. See [`commit_export_interval`].
+	capture_deferred: bool,
 	/// The commit last scanned out, to tell a new buffer from a commit that
 	/// only changed other surface state.
 	last_scanout_commit: Option<(smithay::reexports::wayland_server::backend::ObjectId, CommitCounter)>,
@@ -710,6 +733,7 @@ impl MoonshineCompositor {
 				last_cursor_position: Point::from((width as f64 / 2.0, height as f64 / 2.0)),
 				capture_on_commit,
 				presented_on_commit: None,
+				capture_deferred: false,
 				last_scanout_commit: None,
 				overlay_raised: false,
 				overlay_z_x11_window: None,
@@ -1471,31 +1495,55 @@ impl MoonshineCompositor {
 
 	/// Export the frame `surface` just committed, if it is the one direct
 	/// scanout would pick on the next tick. Its frame callback is left to
-	/// that tick.
+	/// that tick. A commit that comes too soon after the previous frame is
+	/// exported when [`commit_export_interval`] has passed.
 	pub(crate) fn capture_commit(&mut self, surface: &WlSurface) {
-		if !self.capture_on_commit || self.presented_on_commit.is_some() || !self.scanout_allowed() {
+		if !self.capture_on_commit || !self.scanout_allowed() {
 			return;
 		}
 		let commit = with_renderer_surface_state(surface, |state| state.current_commit());
 		if commit.map(|commit| (surface.id(), commit)) == self.last_scanout_commit {
 			return;
 		}
-
-		self.presented_on_commit = if self.is_override_active() {
-			if self.override_surface.as_ref().is_none_or(|(s, _)| s != surface) {
-				return;
-			}
-			self.try_direct_scanout_override(true)
+		let override_active = self.is_override_active();
+		let is_scanout_surface = if override_active {
+			self.override_surface.as_ref().is_some_and(|(s, _)| s == surface)
 		} else {
 			let mut windows = self.space.elements();
 			let is_lone_toplevel = matches!(
 				(windows.next(), windows.next()),
 				(Some(window), None) if window.toplevel().is_some_and(|toplevel| toplevel.wl_surface() == surface)
 			);
-			drop(windows);
-			if !is_lone_toplevel {
-				return;
+			is_lone_toplevel
+		};
+		if !is_scanout_surface {
+			return;
+		}
+
+		let due = self.last_frame_sent_at + commit_export_interval(&self.output);
+		if std::time::Instant::now() < due {
+			if !self.capture_deferred {
+				let surface = surface.clone();
+				self.capture_deferred = self
+					.handle
+					.insert_source(Timer::from_deadline(due), move |_, _, state| {
+						state.capture_deferred = false;
+						state.capture_commit(&surface);
+						TimeoutAction::Drop
+					})
+					.is_ok();
 			}
+			return;
+		}
+		// The tick that sends the previous export's frame callback is late.
+		// Leave this frame to it.
+		if self.presented_on_commit.is_some() {
+			return;
+		}
+
+		self.presented_on_commit = if override_active {
+			self.try_direct_scanout_override(true)
+		} else {
 			self.try_direct_scanout(true)
 		};
 	}
@@ -1531,16 +1579,11 @@ impl MoonshineCompositor {
 			);
 		}
 
-		let frame_period = self
-			.output
-			.preferred_mode()
-			.map(|m| std::time::Duration::from_nanos(1_000_000_000_000u64 / m.refresh.max(1) as u64))
-			.unwrap_or(std::time::Duration::from_millis(11));
 		capture
 			.feedback
 			.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
 			capture.presented_at,
-			Refresh::Fixed(frame_period),
+			Refresh::Fixed(refresh_interval(&self.output)),
 			0,
 			smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(
 			),

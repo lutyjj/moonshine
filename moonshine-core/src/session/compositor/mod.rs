@@ -109,8 +109,10 @@ pub struct CompositorConfig {
 	/// The tick captures a frame up to one refresh interval after the
 	/// application presented it. Capturing on commit removes that wait, at the
 	/// cost of frames leaving at the application's cadence rather than on a
-	/// fixed grid. The application is still paced at the refresh rate. Only
-	/// frames that need no compositing are captured this way.
+	/// fixed grid, though never closer together than a display at that
+	/// refresh rate could show them. The application is still paced at the
+	/// refresh rate. Only frames that need no compositing are captured this
+	/// way.
 	pub capture_on_commit: bool,
 }
 

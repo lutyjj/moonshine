@@ -178,7 +178,8 @@ backpressure drops frames to keep latency bounded.
 
 `compositor.capture_on_commit` defaults to `false`. Enable it to capture eligible
 direct buffers when the application commits them, while keeping frame callbacks
-paced by the refresh tick. Frames requiring composition still use the tick.
+paced by the refresh tick. Captures stay about one refresh interval apart.
+Frames requiring composition still use the tick.
 
 ### Pairing with a client
 
