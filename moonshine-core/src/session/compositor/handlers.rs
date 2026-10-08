@@ -1354,6 +1354,9 @@ impl MoonshineCompositor {
 	/// Deactivate the keyboard target before discarding its focus ownership.
 	fn clear_keyboard_focus(&mut self) {
 		self.current_keyboard_focus_window = None;
+		if let Some(xf) = &mut self.x11_focus {
+			xf.watch_keyboard_focus(None);
+		}
 		if let Some(keyboard) = self.seat.get_keyboard() {
 			if let Some(target) = keyboard.current_focus() {
 				target.window().set_activated(false);
@@ -1477,13 +1480,18 @@ impl MoonshineCompositor {
 			.map(|x| x.window_id());
 		let input_changed =
 			self.input_focus_mode != input_focus_mode || self.current_keyboard_focus_window != keyboard_focus_id;
+		if let Some(x11_focus) = &mut self.x11_focus {
+			x11_focus.watch_keyboard_focus(keyboard_focus_id);
+		}
 		if let Some(ref x11_focus) = self.x11_focus
 			&& let Some(kid) = keyboard_focus_id
 		{
-			if input_changed {
+			if input_changed || !x11_focus.keyboard_focus_matches(kid) {
 				x11_focus.set_input_focus_revert(kid, 0);
-				x11_focus.set_net_active_window(kid);
 				self.current_keyboard_focus_window = Some(kid);
+			}
+			if !x11_focus.net_active_window_matches(kid) {
+				x11_focus.set_net_active_window(kid);
 			}
 		} else if keyboard_focus_id.is_none() {
 			self.current_keyboard_focus_window = None;

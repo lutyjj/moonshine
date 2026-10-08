@@ -50,10 +50,12 @@ const PROPERTY_CHANGE_MASK: libc_c_long = 1 << 22;
 /// `PropertyNotify` event type from `X11/X.h`.
 const PROPERTY_NOTIFY: c_int = 28;
 
+const FOCUS_CHANGE_MASK: libc_c_long = 1 << 21;
+const FOCUS_OUT: c_int = 10;
+
 /// `XEvent` is a union over every event struct; Xlib guarantees it is at most
-/// 24 native `long`s. Only the `XPropertyEvent` member is ever read, but the
-/// buffer handed to `XNextEvent` must be the full union size or the server
-/// will write past it.
+/// 24 native `long`s. The buffer handed to `XNextEvent` must be the full
+/// union size, even when only its event type or property fields are read.
 const X_EVENT_LONGS: usize = 24;
 
 /// `XPropertyEvent` from `X11/Xlib.h`.
@@ -98,6 +100,7 @@ type FnXGetWindowProperty = unsafe extern "C" fn(
 ) -> c_int;
 type FnXFree = unsafe extern "C" fn(*mut c_void) -> c_int;
 type FnXSetInputFocus = unsafe extern "C" fn(*mut XDisplay, Window, c_int, libc_c_ulong) -> c_int;
+type FnXGetInputFocus = unsafe extern "C" fn(*mut XDisplay, *mut Window, *mut c_int) -> c_int;
 type FnXFlush = unsafe extern "C" fn(*mut XDisplay) -> c_int;
 type FnXDefaultRootWindow = unsafe extern "C" fn(*mut XDisplay) -> Window;
 type FnXChangeProperty = unsafe extern "C" fn(
@@ -188,6 +191,7 @@ struct LoadedXlib {
 	xseterrorhandler: Option<FnXSetErrorHandler>,
 	xfree: Option<FnXFree>,
 	xsetinputfocus: Option<FnXSetInputFocus>,
+	xgetinputfocus: Option<FnXGetInputFocus>,
 	xflush: Option<FnXFlush>,
 	xdefaultrootwindow: Option<FnXDefaultRootWindow>,
 	xchangeproperty: Option<FnXChangeProperty>,
@@ -322,6 +326,7 @@ fn load_xlib() {
 				xseterrorhandler: None,
 				xfree: None,
 				xsetinputfocus: None,
+				xgetinputfocus: None,
 				xflush: None,
 				xdefaultrootwindow: None,
 				xchangeproperty: None,
@@ -349,6 +354,8 @@ fn load_xlib() {
 		libc::dlerror();
 		let xsetinputfocus_ptr = dlsym(lib_ptr, c"XSetInputFocus".as_ptr());
 		libc::dlerror();
+		let xgetinputfocus_ptr = dlsym(lib_ptr, c"XGetInputFocus".as_ptr());
+		libc::dlerror();
 		let xflush_ptr = dlsym(lib_ptr, c"XFlush".as_ptr());
 		libc::dlerror();
 		let xdefaultrootwindow_ptr = dlsym(lib_ptr, c"XDefaultRootWindow".as_ptr());
@@ -375,6 +382,7 @@ fn load_xlib() {
 			xseterrorhandler: sym!(xseterrorhandler_ptr, FnXSetErrorHandler),
 			xfree: sym!(xfree_ptr, FnXFree),
 			xsetinputfocus: sym!(xsetinputfocus_ptr, FnXSetInputFocus),
+			xgetinputfocus: sym!(xgetinputfocus_ptr, FnXGetInputFocus),
 			xflush: sym!(xflush_ptr, FnXFlush),
 			xdefaultrootwindow: sym!(xdefaultrootwindow_ptr, FnXDefaultRootWindow),
 			xchangeproperty: sym!(xchangeproperty_ptr, FnXChangeProperty),
@@ -419,6 +427,8 @@ pub(crate) struct X11Focus {
 	/// Pre-interned atom IDs — cached once at construction time to avoid
 	/// repeated `XInternAtom` calls on every property read.
 	atoms: CachedAtoms,
+	/// Toplevel whose focus changes wake the compositor, including child focus.
+	watched_keyboard_window: Option<u32>,
 }
 
 /// Cached X11 atom IDs — interned once at construction time.
@@ -531,6 +541,7 @@ impl X11Focus {
 			dpy,
 			root,
 			atoms,
+			watched_keyboard_window: None,
 			display_name: format!(":{}", display_number),
 		};
 
@@ -608,14 +619,9 @@ impl X11Focus {
 		.is_some()
 	}
 
-	/// Drain queued X11 events, reporting whether Steam's focus control changed.
-	///
-	/// Returns `true` when a `PropertyNotify` for
-	/// `GAMESCOPECTRL_BASELAYER_APPID` or `GAMESCOPECTRL_BASELAYER_WINDOW`
-	/// arrived, meaning the caller should re-run focus selection. The queue is
-	/// always drained fully, even once a match is found, so nothing is left
-	/// behind to wake the event loop again.
-	pub fn drain_focus_control_change(&self) -> bool {
+	/// Drain Steam focus-control events and departures from keyboard focus.
+	/// A client can change X11 focus after the compositor applied its target.
+	pub fn drain_focus_changes(&self) -> bool {
 		if self.dpy.is_null() {
 			return false;
 		}
@@ -627,19 +633,24 @@ impl X11Focus {
 			unsafe {
 				while pending(self.dpy) > 0 {
 					next(self.dpy, event.as_mut_ptr() as *mut c_void);
-					// Every XEvent variant starts with the event type.
-					if *(event.as_ptr() as *const c_int) != PROPERTY_NOTIFY {
+					let event_type = *(event.as_ptr() as *const c_int);
+					if event_type == FOCUS_OUT {
+						changed = true;
+						continue;
+					}
+					if event_type != PROPERTY_NOTIFY {
 						continue;
 					}
 					let property = &*(event.as_ptr() as *const XPropertyEvent);
 					if property.window == self.root
 						&& (property.atom == self.atoms.gamescopectrl_baselayer_appid
-							|| property.atom == self.atoms.gamescopectrl_baselayer_window)
+							|| property.atom == self.atoms.gamescopectrl_baselayer_window
+							|| property.atom == self.atoms.net_active_window)
 					{
 						tracing::debug!(
 							target: "focus",
 							atom = property.atom,
-							"Steam focus control changed on root window"
+							"X11 focus property changed on root window"
 						);
 						changed = true;
 					}
@@ -648,6 +659,56 @@ impl X11Focus {
 			Some(changed)
 		})
 		.unwrap_or(false)
+	}
+
+	/// Move the focus-change subscription with the selected keyboard toplevel.
+	pub fn watch_keyboard_focus(&mut self, window_id: Option<u32>) {
+		if self.dpy.is_null() || self.watched_keyboard_window == window_id {
+			return;
+		}
+		let watched = with_xlib(|loaded| {
+			let select = loaded.xselectinput?;
+			let get_focus = loaded.xgetinputfocus?;
+			let seterr = loaded.xseterrorhandler?;
+			unsafe {
+				let prev = seterr(Some(silent_x11_error));
+				if let Some(old) = self.watched_keyboard_window {
+					select(self.dpy, old as Window, 0);
+				}
+				if let Some(window) = window_id {
+					select(self.dpy, window as Window, FOCUS_CHANGE_MASK);
+				}
+				// Complete the requests before restoring the handler: the old
+				// target may already have been destroyed.
+				let mut focus = 0;
+				let mut revert = 0;
+				get_focus(self.dpy, &mut focus, &mut revert);
+				seterr(prev);
+			}
+			Some(())
+		});
+		if watched.is_some() {
+			self.watched_keyboard_window = window_id;
+		}
+	}
+
+	/// Keep valid child focus while detecting focus outside the selected toplevel.
+	pub fn keyboard_focus_matches(&self, window_id: u32) -> bool {
+		if self.dpy.is_null() {
+			return false;
+		}
+		let focus = with_xlib(|loaded| {
+			let get_focus = loaded.xgetinputfocus?;
+			let mut focus = 0;
+			let mut revert = 0;
+			unsafe { get_focus(self.dpy, &mut focus, &mut revert) };
+			Some(focus as u32)
+		});
+		focus.is_some_and(|focus| focus == window_id || self.get_ancestor_chain(focus).contains(&window_id))
+	}
+
+	pub fn net_active_window_matches(&self, window_id: u32) -> bool {
+		self.read_cardinal_array_prop(self.root, self.atoms.net_active_window, 1) == [window_id]
 	}
 
 	/// Read a single CARDINAL (format-32) window property by pre-interned atom.

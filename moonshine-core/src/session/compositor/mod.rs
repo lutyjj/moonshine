@@ -540,6 +540,7 @@ fn run_compositor(
 		event_loop
 			.dispatch(None, &mut state)
 			.map_err(|e| format!("Event loop dispatch error: {e}"))?;
+		state.dispatch_x11_focus_events();
 	}
 
 	// Stop the application first so X11 clients disconnect from

@@ -369,8 +369,7 @@ pub(crate) struct MoonshineCompositor {
 	pub xdisplay_tx: Option<mpsc::SyncSender<super::CompositorReady>>,
 	/// Registration token for the compositor's Wayland listening socket.
 	pub wayland_socket_token: Option<RegistrationToken>,
-	/// Registration token for the root-window `PropertyNotify` source that
-	/// watches Steam's focus control properties.
+	/// Registration token for X11 focus-control and keyboard-focus events.
 	pub x11_focus_token: Option<RegistrationToken>,
 	/// Name of the compositor's Wayland socket in XDG_RUNTIME_DIR.
 	pub wayland_display: String,
@@ -449,8 +448,7 @@ pub(crate) struct MoonshineCompositor {
 	/// `focus_t::inputFocusWindow`), separate from the presented focus.
 	pub input_focus_window: Option<smithay::desktop::Window>,
 
-	/// X11 window ID last focused by the X server (gamescope's
-	/// `currentKeyboardFocusWindow`).
+	/// X11 keyboard toplevel last applied; clients may move actual X11 focus.
 	pub current_keyboard_focus_window: Option<u32>,
 
 	/// `STEAM_INPUT_FOCUS` of the input focus window last applied.
@@ -2145,13 +2143,7 @@ impl MoonshineCompositor {
 		let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
 		let source = calloop::generic::Generic::new(borrowed, calloop::Interest::READ, calloop::Mode::Level);
 		match self.handle.insert_source(source, |_, _, state: &mut Self| {
-			if state
-				.x11_focus
-				.as_ref()
-				.is_some_and(|x11_focus| x11_focus.drain_focus_control_change())
-			{
-				state.reevaluate_focus();
-			}
+			state.dispatch_x11_focus_events();
 			Ok(calloop::PostAction::Continue)
 		}) {
 			Ok(token) => {
@@ -2161,6 +2153,13 @@ impl MoonshineCompositor {
 			Err(e) => {
 				tracing::error!("Failed to insert X11 focus control source: {e}");
 			},
+		}
+	}
+
+	/// Xlib property reads can queue events without leaving its fd readable.
+	pub fn dispatch_x11_focus_events(&mut self) {
+		if self.x11_focus.as_ref().is_some_and(|xf| xf.drain_focus_changes()) {
+			self.reevaluate_focus();
 		}
 	}
 
