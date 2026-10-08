@@ -201,6 +201,22 @@ pub(crate) struct WindowMetadata {
 }
 
 impl WindowMetadata {
+	/// Overlay placement follows the output width; input requires a separate request.
+	pub fn is_interactive_overlay(&self, output_width: i32) -> bool {
+		self.is_overlay && (self.geometry.size.w >= output_width || self.requests_input_focus())
+	}
+
+	pub fn requests_input_focus(&self) -> bool {
+		self.is_overlay && self.input_focus_mode != 0
+	}
+
+	pub fn update_overlay_flags(&mut self, output_width: i32) {
+		let interactive = self.is_interactive_overlay(output_width);
+		self.flags.set(WindowFlags::OVERLAY, interactive);
+		self.flags
+			.set(WindowFlags::NOTIFICATION, self.is_overlay && !interactive);
+	}
+
 	/// An opaque Steam focus identifier, not necessarily an X11 resource.
 	pub fn steam_window_id(&self) -> u32 {
 		self.x11_window_id
@@ -318,9 +334,9 @@ bitflags! {
 	/// Each flag corresponds to a gamescope `steamcompmgr_win_t` boolean field.
 	#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 	pub struct WindowFlags: u8 {
-		/// Steam overlay (STEAM_OVERLAY != 0 AND width > 1200).
+		/// Steam overlay spanning the output width or requesting input.
 		const OVERLAY = 1 << 0;
-		/// Steam notification (STEAM_OVERLAY != 0 AND width <= 1200).
+		/// Steam notification narrower than the output and requesting no input.
 		const NOTIFICATION = 1 << 1;
 		/// External overlay (GAMESCOPE_EXTERNAL_OVERLAY property).
 		const EXTERNAL_OVERLAY = 1 << 2;
@@ -498,6 +514,29 @@ impl FocusState {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn notification_input_requests_are_reversible_without_losing_other_flags() {
+		let mut meta = WindowMetadata {
+			is_overlay: true,
+			geometry: smithay::utils::Rectangle::from_size((1400, 160).into()),
+			flags: WindowFlags::EXTERNAL_OVERLAY,
+			..Default::default()
+		};
+		meta.update_overlay_flags(2560);
+		assert_eq!(meta.flags, WindowFlags::EXTERNAL_OVERLAY | WindowFlags::NOTIFICATION);
+		assert!(!meta.requests_input_focus());
+
+		meta.input_focus_mode = 1;
+		meta.update_overlay_flags(2560);
+		assert_eq!(meta.flags, WindowFlags::EXTERNAL_OVERLAY | WindowFlags::OVERLAY);
+		assert!(meta.requests_input_focus());
+
+		meta.input_focus_mode = 0;
+		meta.update_overlay_flags(2560);
+		assert_eq!(meta.flags, WindowFlags::EXTERNAL_OVERLAY | WindowFlags::NOTIFICATION);
+		assert!(!meta.requests_input_focus());
+	}
 
 	fn make_meta(fields: &[(&str, &str)]) -> WindowMetadata {
 		let mut m = WindowMetadata::default();

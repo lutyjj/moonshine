@@ -325,9 +325,6 @@ pub(crate) struct MoonshineCompositor {
 	pub screen_dirty: bool,
 	/// Timestamp of the last frame that was actually sent to the encoder.
 	pub last_frame_sent_at: std::time::Instant,
-	/// Set when a STEAM_OVERLAY property-notify arrives, so the overlay z-order
-	/// is re-evaluated immediately (see update_overlay_z_order).
-	pub overlay_dirty: bool,
 	/// Cached cursor position from the last sent frame, to detect cursor-only
 	/// changes without a surface commit.
 	pub last_cursor_position: Point<f64, Logical>,
@@ -345,12 +342,6 @@ pub(crate) struct MoonshineCompositor {
 	/// The commit last scanned out, to tell a new buffer from a commit that
 	/// only changed other surface state.
 	last_scanout_commit: Option<(smithay::reexports::wayland_server::backend::ObjectId, CommitCounter)>,
-
-	// -- Steam overlay z-order --
-	/// True while the Steam overlay window is raised above the game.
-	pub overlay_raised: bool,
-	/// X11 window ID of the raised overlay window (to lower it on close).
-	pub overlay_z_x11_window: Option<u32>,
 
 	// -- Extended protocols --
 	pub viewporter_state: smithay::wayland::viewporter::ViewporterState,
@@ -437,11 +428,11 @@ pub(crate) struct MoonshineCompositor {
 	/// Gamescope: `focus_t::decorationWindows`.
 	pub decoration_windows: Vec<smithay::desktop::Window>,
 
-	/// Currently active Steam overlay window (width > 1200 + STEAM_OVERLAY).
+	/// Selected Steam overlay spanning the output width or requesting input.
 	/// Gamescope: `focus_t::overlayWindow` — the main Steam overlay window.
 	pub overlay_window: Option<smithay::desktop::Window>,
 
-	/// Currently active Steam notification window (width <= 1200 + STEAM_OVERLAY).
+	/// Selected Steam notification, narrower than the output and requesting no input.
 	/// Gamescope: `focus_t::notificationWindow` — small Steam notification popups.
 	pub notification_window: Option<smithay::desktop::Window>,
 
@@ -748,14 +739,11 @@ impl MoonshineCompositor {
 				render_count: 0,
 				screen_dirty: true,
 				last_frame_sent_at: std::time::Instant::now(),
-				overlay_dirty: true,
 				last_cursor_position: Point::from((width as f64 / 2.0, height as f64 / 2.0)),
 				capture_on_commit,
 				presented_on_commit: None,
 				capture_deferred: false,
 				last_scanout_commit: None,
-				overlay_raised: false,
-				overlay_z_x11_window: None,
 				viewporter_state,
 				color_management,
 				deferred_info_done: Vec::new(),
@@ -809,13 +797,14 @@ impl MoonshineCompositor {
 	/// Mirrors gamescope's `steamcompmgr_win_t::current_surface()`: a window
 	/// presents the override surface whenever one is set, in place of its X11
 	/// content, at the window's own geometry.
+	#[expect(clippy::mutable_key_type, reason = "Smithay Window hashes its immutable identity")]
 	fn space_render_elements_with_override(
 		renderer: &mut GlesRenderer,
 		space: &Space<smithay::desktop::Window>,
 		output: &Output,
 		override_surface: Option<(&WlSurface, u32)>,
-		decoration_windows: &[smithay::desktop::Window],
-		override_underlay_window: Option<&smithay::desktop::Window>,
+		foreground_windows: &[smithay::desktop::Window],
+		window_metadata: &HashMap<smithay::desktop::Window, super::focus::WindowMetadata>,
 	) -> Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> {
 		let output_scale = output.current_scale().fractional_scale();
 		let scale = smithay::utils::Scale::from(output_scale);
@@ -854,19 +843,23 @@ impl MoonshineCompositor {
 				}
 			};
 
-		// Paint order, back to front. `Space::elements()` is back to front.
-		let mut paint_order: Vec<&smithay::desktop::Window> = space
+		// Paint order, back to front. Hidden/unselected overlays are not game content.
+		let mut paint_order: Vec<_> = space
 			.elements()
-			// Decorations and the carried override underlay are painted on top.
-			.filter(|window| !decoration_windows.contains(window) && override_underlay_window != Some(*window))
+			.filter(|window| {
+				!foreground_windows.contains(window)
+					&& window_metadata.get(window).is_none_or(|meta| {
+						!meta.flags.intersects(
+							super::focus::WindowFlags::OVERLAY
+								| super::focus::WindowFlags::NOTIFICATION
+								| super::focus::WindowFlags::EXTERNAL_OVERLAY,
+						)
+					})
+			})
 			.collect();
-
-		// Same-app decorations ride above the focus window; the underlay sits
-		// between them and the override.
 		paint_order.extend(
-			decoration_windows
+			foreground_windows
 				.iter()
-				.chain(override_underlay_window.iter().copied())
 				.filter(|window| space.elements().any(|e| e == *window)),
 		);
 
@@ -994,132 +987,20 @@ impl MoonshineCompositor {
 		with_renderer_surface_state(surface, |st| st.buffer_size().map(|s| (s.w, s.h))).flatten()
 	}
 
-	/// Raise/lower the Steam overlay above/below the game when `STEAM_OVERLAY`
-	/// changes.
-	///
-	/// Event-driven: smithay forwards the `STEAM_OVERLAY` property change to
-	/// `property_notify` as `WmWindowProperty::Other`, which sets
-	/// `overlay_dirty`. We scan (limited to wide X11 windows, gamescope's
-	/// `isOverlay` rule) only on that event, so gameplay never pays a blocking
-	/// X11 roundtrip.
-	fn update_overlay_z_order(&mut self) {
-		if !self.overlay_dirty {
-			return;
-		}
-		self.overlay_dirty = false;
-		let Some(xf) = self.x11_focus.as_ref() else { return };
-
-		// A wide X11 window Steam currently flags as overlay (STEAM_OVERLAY).
-		let active_overlay = self
-			.space
-			.elements()
-			.filter(|w| w.geometry().size.w > 1200 && w.x11_surface().is_some())
-			.find(|w| {
-				w.x11_surface()
-					.map(|x| xf.get_steam_overlay_value(x.window_id()) != 0)
-					.unwrap_or(false)
-			})
-			.cloned();
-
-		let Some(overlay) = active_overlay else {
-			// Overlay closed (or not open): restore the game above it.
-			if self.overlay_raised {
-				let raised_xid = self.overlay_z_x11_window;
-				tracing::debug!(
-					xid = ?raised_xid,
-					"overlay-lower: STEAM_OVERLAY cleared — restoring game above overlay"
-				);
-				self.overlay_raised = false;
-				self.overlay_z_x11_window = None;
-				// Re-raise the game window (app_id != 0) above the overlay.
-				let game = self
-					.space
-					.elements()
-					.filter(|w| w.x11_surface().is_none_or(|x| Some(x.window_id()) != raised_xid))
-					.find(|w| {
-						self.window_metadata
-							.get(w)
-							.is_some_and(|m| m.app_id != 0 && m.app_id != super::x11_focus::STEAM_BIG_PICTURE_APPID)
-					})
-					.cloned();
-				if let Some(game) = game {
-					self.space.raise_element(&game, false);
-					// Restore the focus contract to the game.
-					if let Some(xf) = self.x11_focus.as_ref() {
-						let app_id = self.window_metadata.get(&game).map(|m| m.app_id).unwrap_or(0);
-						let window_id = self
-							.window_metadata
-							.get(&game)
-							.map(|m| m.steam_window_id())
-							.unwrap_or(0);
-						xf.set_focused_window_contract(app_id, window_id);
-					}
-					// Reverse the activation handoff: deactivate the overlay,
-					// reactivate the game.
-					if let Some(overlay) = self
-						.space
-						.elements()
-						.find(|w| w.x11_surface().is_some_and(|x| Some(x.window_id()) == raised_xid))
-						.cloned()
-					{
-						overlay.set_activated(false);
-					}
-					game.set_activated(true);
-				}
-				self.screen_dirty = true;
-				// Rebuild the focusable lists: the overlay is no longer raised,
-				// so BPM (769) is focusable again (gamescope restores it).
-				self.reevaluate_focus();
-			}
-			return;
-		};
-
-		let xid = overlay.x11_surface().map(|x| x.window_id()).unwrap_or(u32::MAX);
-		if self.overlay_z_x11_window != Some(xid) {
-			tracing::debug!(xid, "overlay-raise: STEAM_OVERLAY=1 — raising overlay above game");
-			self.space.raise_element(&overlay, false);
-			self.overlay_raised = true;
-			self.overlay_z_x11_window = Some(xid);
-			// Find the game window (non-overlay window with a valid app_id).
-			let game = self
-				.space
-				.elements()
-				.filter(|w| w.x11_surface().is_none_or(|x| x.window_id() != xid))
-				.find(|w| {
-					self.window_metadata
-						.get(w)
-						.is_some_and(|m| m.app_id != 0 && m.app_id != super::x11_focus::STEAM_BIG_PICTURE_APPID)
-				})
-				.cloned();
-			let game_app_id = game
-				.as_ref()
-				.and_then(|g| self.window_metadata.get(g))
-				.map(|m| m.app_id)
-				.unwrap_or(0);
-			// Split: input goes to the overlay (769), rendering stays on the game.
-			if let Some(xf) = self.x11_focus.as_ref() {
-				xf.set_focused_app_split(super::x11_focus::STEAM_BIG_PICTURE_APPID, game_app_id);
-			}
-			// Activation handoff: deactivate the game, activate the overlay.
-			if let Some(ref game) = game {
-				game.set_activated(false);
-			}
-			overlay.set_activated(true);
-			self.screen_dirty = true;
-			// Rebuild the focusable lists: while the overlay is raised, BPM (769)
-			// is excluded so Steam routes the gamepad to the overlay, not to BPM.
-			// Native gamescope writes focusable_apps=[game] during the overlay.
-			self.reevaluate_focus();
-		}
+	/// Visible overlays are composited above the game without changing input focus.
+	fn visible_overlay_windows(&self) -> impl Iterator<Item = &smithay::desktop::Window> {
+		[
+			self.external_overlay_window.as_ref(),
+			self.overlay_window.as_ref(),
+			self.notification_window.as_ref(),
+		]
+		.into_iter()
+		.flatten()
+		.filter(|window| self.window_metadata.get(window).is_some_and(|meta| meta.opacity != 0))
 	}
 
 	/// Render the current scene and export the frame to the encoder.
 	pub fn render_and_export(&mut self) {
-		// Keep the Steam overlay z-ordered above the game while it is open.
-		// Must run before the static-screen early return so the raise/lower
-		// is detected as soon as the overlay window commits a frame.
-		self.update_overlay_z_order();
-
 		// Detect cursor-only movement as a screen change.
 		if self.cursor_position != self.last_cursor_position {
 			self.screen_dirty = true;
@@ -1241,6 +1122,18 @@ impl MoonshineCompositor {
 			tracing::debug!("Failed to set downscale filter: {e}");
 		}
 
+		let mut foreground_windows = Vec::new();
+		for window in self
+			.decoration_windows
+			.iter()
+			.chain(self.override_underlay_window.iter())
+			.chain(self.visible_overlay_windows())
+		{
+			// A window can fill multiple roles; paint it once at its highest layer.
+			foreground_windows.retain(|existing| existing != window);
+			foreground_windows.push(window.clone());
+		}
+
 		// Bind the pre-allocated Dmabuf as a render target.
 		let bind_result = self.renderer.bind(&mut self.buffer_pool[idx].dmabuf);
 		let mut framebuffer = match bind_result {
@@ -1322,8 +1215,8 @@ impl MoonshineCompositor {
 			&self.space,
 			&self.output,
 			override_target.as_ref().map(|(s, w)| (s, *w)),
-			&self.decoration_windows,
-			self.override_underlay_window.as_ref(),
+			&foreground_windows,
+			&self.window_metadata,
 		);
 		elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
 
@@ -1500,16 +1393,14 @@ impl MoonshineCompositor {
 		}
 	}
 
-	/// Whether a client buffer may go to the encoder as is. An actually-drawn
-	/// cursor (not client-hidden) needs compositing, and so does a raised Steam
-	/// overlay, which is painted together with the game (gamescope's
-	/// `paint_all`).
+	/// Direct scanout must not bypass a visible notification or overlay.
+	/// Both refresh ticks and capture on commit use this decision.
 	fn scanout_allowed(&self) -> bool {
 		let pointer_active = self
 			.last_pointer_activity
 			.is_some_and(|t| t.elapsed() <= std::time::Duration::from_secs(3));
 		let cursor_visible = pointer_active && !matches!(self.cursor_status, CursorImageStatus::Hidden);
-		!cursor_visible && !self.overlay_raised
+		!cursor_visible && self.visible_overlay_windows().next().is_none()
 	}
 
 	/// Export the frame `surface` just committed, if it is the one direct

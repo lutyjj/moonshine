@@ -634,18 +634,10 @@ impl MoonshineCompositor {
 		// interactive overlay (full root-window width or asking for input) and
 		// notifications (everything else) at focus time.
 		let is_overlay = self.with_x11_focus(|xf| xf.get_steam_overlay_value(window.window_id())) != 0;
-		let interactive_overlay = window.geometry().size.w >= self.width as i32 || input_focus_mode != 0;
 
 		// Build WindowFlags: overlay/tray/streaming/VR classification.
 		// Packed into a single u8 instead of 7 separate bool fields.
 		let mut flags = WindowFlags::empty();
-		if is_overlay {
-			if interactive_overlay {
-				flags.insert(WindowFlags::OVERLAY);
-			} else {
-				flags.insert(WindowFlags::NOTIFICATION);
-			}
-		}
 
 		// External overlays, streaming clients, VR targets.
 		let is_external_overlay = self.with_x11_focus(|xf| {
@@ -726,7 +718,7 @@ impl MoonshineCompositor {
 		let skip_taskbar = skip_taskbar || (window.is_override_redirect() && has_transient_parent);
 		let skip_pager = skip_pager || (window.is_override_redirect() && has_transient_parent);
 
-		WindowMetadata {
+		let mut meta = WindowMetadata {
 			app_id,
 			steam_app_id,
 			steam_legacy_big_picture,
@@ -762,7 +754,9 @@ impl MoonshineCompositor {
 			input_focus_mode,
 			flags,
 			damage_sequence: 0, // assigned by caller for game windows
-		}
+		};
+		meta.update_overlay_flags(self.width as i32);
+		meta
 	}
 
 	/// Re-read live X11 properties for all tracked windows.
@@ -788,6 +782,7 @@ impl MoonshineCompositor {
 							"STEAM_INPUT_FOCUS changed on overlay"
 						);
 						meta.input_focus_mode = new_mode;
+						meta.update_overlay_flags(self.width as i32);
 					}
 				}
 			}
@@ -840,7 +835,7 @@ impl MoonshineCompositor {
 			};
 
 			if meta.is_overlay {
-				let interactive = meta.geometry.size.w >= self.width as i32 || meta.input_focus_mode != 0;
+				let interactive = meta.is_interactive_overlay(self.width as i32);
 				if interactive && meta.opacity >= max_overlay_opacity {
 					best_overlay = Some(window.clone());
 					max_overlay_opacity = meta.opacity;
@@ -848,7 +843,7 @@ impl MoonshineCompositor {
 					best_notification = Some(window.clone());
 				}
 
-				if meta.input_focus_mode != 0 {
+				if meta.requests_input_focus() {
 					input_focus = Some(window.clone());
 				}
 			}
@@ -873,6 +868,7 @@ impl MoonshineCompositor {
 			|| old_input_focus != self.input_focus_window
 		{
 			self.focus_state.mark_dirty();
+			self.screen_dirty = true;
 		}
 	}
 
@@ -1355,6 +1351,18 @@ impl MoonshineCompositor {
 		underlay
 	}
 
+	/// Deactivate the keyboard target before discarding its focus ownership.
+	fn clear_keyboard_focus(&mut self) {
+		self.current_keyboard_focus_window = None;
+		if let Some(keyboard) = self.seat.get_keyboard() {
+			if let Some(target) = keyboard.current_focus() {
+				target.window().set_activated(false);
+			}
+			let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+			keyboard.set_focus(self, None, serial);
+		}
+	}
+
 	/// Apply the selected focus window: set keyboard/pointer targets,
 	/// XDG activation state, and Smithay keyboard focus.
 	fn apply_focus(&mut self, best: &Window) {
@@ -1363,6 +1371,7 @@ impl MoonshineCompositor {
 		// all override windows are dismissed.
 		let old_focused_x11 = self.focused_x11_window;
 		let old_focused_window = self.focused_window.clone();
+		let old_keyboard_target = self.seat.get_keyboard().and_then(|keyboard| keyboard.current_focus());
 
 		if let Some(x11) = best.x11_surface() {
 			self.focused_x11_window = Some(x11.window_id());
@@ -1372,19 +1381,6 @@ impl MoonshineCompositor {
 			self.focused_x11_window = None;
 		}
 		self.focused_window = Some(best.clone());
-
-		// Write the gamescope focus contract (FOCUSED_APP/GFX/WINDOW + displays).
-		if let Some(ref x11_focus) = self.x11_focus {
-			let focused_app_id = self.window_metadata.get(best).map(|m| m.app_id).unwrap_or(0);
-			let focused_window_id = self.window_metadata.get(best).map(|m| m.steam_window_id()).unwrap_or(0);
-			x11_focus.set_focused_window_contract(focused_app_id, focused_window_id);
-			// When the overlay is raised, input routes to the overlay while
-			// rendering stays on the game (matches gamescope's
-			// inputFocusWindow / focusWindow split).
-			if self.overlay_raised {
-				x11_focus.set_focused_app_split(super::x11_focus::STEAM_BIG_PICTURE_APPID, focused_app_id);
-			}
-		}
 
 		// Focus changed if either the X11 window ID or the actual window changed.
 		let focus_changed = old_focused_x11 != self.focused_x11_window
@@ -1408,6 +1404,14 @@ impl MoonshineCompositor {
 			Some(input_focus.clone())
 		};
 
+		// Steam's controller focus follows the input target, not the visual overlay.
+		if let Some(ref x11_focus) = self.x11_focus {
+			let input_app_id = self.window_metadata.get(&input_focus).map(|m| m.app_id).unwrap_or(0);
+			let gfx_app_id = self.window_metadata.get(best).map(|m| m.app_id).unwrap_or(0);
+			let window_id = self.window_metadata.get(best).map(|m| m.steam_window_id()).unwrap_or(0);
+			x11_focus.set_focused_window_contract(input_app_id, gfx_app_id, window_id);
+		}
+
 		// Pointer focus follows inputFocus — the overlay when it asks for input.
 		let pointer_target: Option<Window> = Some(input_focus.clone());
 		self.pointer_focus_window = pointer_target.clone();
@@ -1429,21 +1433,14 @@ impl MoonshineCompositor {
 			);
 		}
 
-		// Activation state: call set_activated on old and new XDG toplevels.
-		// Deactivate the old window whether it was X11 or Wayland.
-		// When the overlay is raised, skip activation — the overlay is already
-		// activated by update_overlay_z_order, and activating the game would
-		// clobber _NET_ACTIVE_WINDOW back to the game window.
-		if !self.overlay_raised {
-			if let Some(ref old_win) = old_focused_window
-				&& old_win.toplevel().is_some()
-				&& old_win != best
-			{
-				old_win.set_activated(false);
-			}
-			if best.toplevel().is_some() {
-				best.set_activated(true);
-			}
+		// Activation follows keyboard focus, including mode 2's game keyboard target.
+		if let Some(old) = old_keyboard_target.as_ref()
+			&& keyboard_target.as_ref() != Some(old.window())
+		{
+			old.window().set_activated(false);
+		}
+		if let Some(target) = keyboard_target.as_ref() {
+			target.set_activated(true);
 		}
 
 		// Keyboard focus persistence.
@@ -1617,12 +1614,12 @@ impl MoonshineCompositor {
 		// GAMESCOPE_FOCUSABLE_APPS and GAMESCOPE_FOCUSABLE_WINDOWS to the root
 		// window so Steam can route controller input to the correct app.
 		// GAMESCOPE_FOCUSABLE_WINDOWS uses [window_id, app_id, pid] triplets.
-		// When the overlay is raised, BPM (769) is excluded — it's the active
-		// overlay, not a focusable target.
+		// While an overlay requests input, BPM (769) is the input target rather
+		// than another focusable app. Notifications leave this list unchanged.
 		if let Some(ref x11_focus) = self.x11_focus {
-			let overlay_raised = self.overlay_raised;
+			let overlay_has_input = self.input_focus_window.is_some();
 			let is_focusable =
-				|aid: u32| aid != 0 && (!overlay_raised || aid != super::x11_focus::STEAM_BIG_PICTURE_APPID);
+				|aid: u32| aid != 0 && (!overlay_has_input || aid != super::x11_focus::STEAM_BIG_PICTURE_APPID);
 			let focusable_app_ids: Vec<u32> = candidates
 				.iter()
 				.filter_map(|w| self.window_metadata.get(w).map(|m| m.app_id))
@@ -1681,10 +1678,7 @@ impl MoonshineCompositor {
 			// even if the last focused window was a Wayland window
 			// (focused_x11_window == None). Without this, Smithay keyboard
 			// focus can remain on a dead Wayland surface.
-			if let Some(keyboard) = self.seat.get_keyboard() {
-				let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-				keyboard.set_focus(self, None, serial);
-			}
+			self.clear_keyboard_focus();
 			if let Some(ref x11_focus) = self.x11_focus {
 				x11_focus.clear_focused_app();
 			}
@@ -2233,8 +2227,20 @@ impl XwmHandler for MoonshineCompositor {
 	}
 
 	fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: smithay::xwayland::xwm::WmWindowProperty) {
-		// STEAM_OVERLAY (forwarded as Other) drives overlay z-order: mark it
-		// dirty so update_overlay_z_order runs this frame instead of polling.
+		// Typed opacity events must refresh Moonshine's normalized opacity too.
+		if matches!(property, smithay::xwayland::xwm::WmWindowProperty::Opacity) {
+			if let Some(elem) = self.find_window_by_x11_surface(&window) {
+				let opacity = self.with_x11_focus(|xf| xf.get_window_opacity(window.window_id()));
+				if let Some(meta) = self.window_metadata.get_mut(&elem) {
+					meta.opacity = opacity;
+				}
+			}
+			self.screen_dirty = true;
+			self.reevaluate_focus();
+			return;
+		}
+
+		// Overlay properties affect visual classification and input routing separately.
 		if let smithay::xwayland::xwm::WmWindowProperty::Other(atom) = property
 			&& self.x11_focus.as_ref().is_some_and(|xf| xf.is_overlay_property(atom))
 		{
@@ -2249,16 +2255,14 @@ impl XwmHandler for MoonshineCompositor {
 						xf.get_input_focus_mode(window_id),
 					)
 				});
-				let interactive = window.geometry().size.w >= self.width as i32 || input_focus_mode != 0;
 				if let Some(meta) = self.window_metadata.get_mut(&elem) {
 					meta.is_overlay = is_overlay;
 					meta.opacity = opacity;
 					meta.input_focus_mode = input_focus_mode;
-					meta.flags.set(WindowFlags::OVERLAY, is_overlay && interactive);
-					meta.flags.set(WindowFlags::NOTIFICATION, is_overlay && !interactive);
+					meta.geometry = window.geometry();
+					meta.update_overlay_flags(self.width as i32);
 				}
 			}
-			self.overlay_dirty = true;
 			self.screen_dirty = true;
 			self.reevaluate_focus();
 			return;
@@ -2402,7 +2406,8 @@ impl XwmHandler for MoonshineCompositor {
 			return;
 		}
 		let win = Window::new_x11_window(window.clone());
-		self.space.map_element(win.clone(), (0, 0), true);
+		// Mapping alone must not deactivate the game for a notification.
+		self.space.map_element(win.clone(), (0, 0), false);
 
 		// Store metadata for focus priority decisions.
 		let mut meta = self.x11_surface_metadata(&window);
@@ -2581,10 +2586,7 @@ impl XwmHandler for MoonshineCompositor {
 		if was_focused || focused_is_transient_child || self.focused_x11_window.is_none() || is_special {
 			if was_focused || focused_is_transient_child {
 				self.focused_x11_window = None;
-				if let Some(keyboard) = self.seat.get_keyboard() {
-					let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-					keyboard.set_focus(self, None, serial);
-				}
+				self.clear_keyboard_focus();
 			}
 			self.reevaluate_focus();
 		}
@@ -2656,42 +2658,13 @@ impl XwmHandler for MoonshineCompositor {
 		};
 		self.space.map_element(elem.clone(), geometry.loc, false);
 
-		// A Steam overlay that resizes across the interactive/notification
-		// boundary must switch flags; stale flags route input to the wrong
-		// Steam window.
-		let window_id = window.window_id();
-		let root_width = self.width as i32;
-		let needs_reclassify = self.window_metadata.get(&elem).is_some_and(|m| m.is_overlay);
-
-		// Read steam_overlay_value BEFORE the mutable borrow to avoid conflict.
-		let steam_overlay_value = if needs_reclassify {
-			Some(self.with_x11_focus(|xf| xf.get_steam_overlay_value(window_id)))
-		} else {
-			None
-		};
-
 		if let Some(meta) = self.window_metadata.get_mut(&elem) {
-			let old_flags = meta.flags;
 			meta.geometry = geometry;
-
-			// Only reclassify if the window has the STEAM_OVERLAY property.
-			if let Some(sov) = steam_overlay_value
-				&& sov != 0
-			{
-				let interactive = geometry.size.w >= root_width || meta.input_focus_mode != 0;
-				if interactive {
-					meta.flags.remove(WindowFlags::NOTIFICATION);
-					meta.flags.insert(WindowFlags::OVERLAY);
-				} else {
-					meta.flags.remove(WindowFlags::OVERLAY);
-					meta.flags.insert(WindowFlags::NOTIFICATION);
-				}
-			}
-
-			// If classification changed, mark focus dirty so routing is updated.
-			if meta.flags != old_flags {
-				self.focus_state.mark_dirty();
-			}
+			meta.update_overlay_flags(self.width as i32);
+		}
+		self.screen_dirty = true;
+		if self.window_metadata.get(&elem).is_some_and(|meta| meta.is_overlay) {
+			self.reevaluate_focus();
 		}
 	}
 

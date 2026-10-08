@@ -1289,14 +1289,16 @@ impl X11Focus {
 		self.delete_property(self.root, self.atoms.gamescope_focused_window);
 	}
 
-	/// Write the gamescope focus contract (FOCUSED_APP/GFX/WINDOW + displays)
-	/// so Steam's controller routing targets the focused window.
-	pub fn set_focused_window_contract(&self, app_id: u32, window_id: u32) {
-		if app_id != 0 {
-			self.write_cardinal_prop(self.root, self.atoms.gamescope_focused_app, app_id);
-			self.write_cardinal_prop(self.root, self.atoms.gamescope_focused_app_gfx, app_id);
+	/// Publish input and presentation focus together; overlays may split them.
+	pub fn set_focused_window_contract(&self, input_app_id: u32, gfx_app_id: u32, window_id: u32) {
+		if input_app_id != 0 {
+			self.write_cardinal_prop(self.root, self.atoms.gamescope_focused_app, input_app_id);
 		} else {
 			self.delete_property(self.root, self.atoms.gamescope_focused_app);
+		}
+		if gfx_app_id != 0 {
+			self.write_cardinal_prop(self.root, self.atoms.gamescope_focused_app_gfx, gfx_app_id);
+		} else {
 			self.delete_property(self.root, self.atoms.gamescope_focused_app_gfx);
 		}
 		if window_id != 0 {
@@ -1311,22 +1313,6 @@ impl X11Focus {
 			self.atoms.gamescope_keyboard_focus_display,
 			&self.display_name,
 		);
-	}
-
-	/// Write GAMESCOPE_FOCUSED_APP and FOCUSED_APP_GFX with potentially
-	/// different values (used when the overlay is raised: input goes to
-	/// the overlay, rendering stays on the game).
-	pub fn set_focused_app_split(&self, input_app_id: u32, gfx_app_id: u32) {
-		if input_app_id != 0 {
-			self.write_cardinal_prop(self.root, self.atoms.gamescope_focused_app, input_app_id);
-		} else {
-			self.delete_property(self.root, self.atoms.gamescope_focused_app);
-		}
-		if gfx_app_id != 0 {
-			self.write_cardinal_prop(self.root, self.atoms.gamescope_focused_app_gfx, gfx_app_id);
-		} else {
-			self.delete_property(self.root, self.atoms.gamescope_focused_app_gfx);
-		}
 	}
 
 	/// Write the list of focusable app IDs to GAMESCOPE_FOCUSABLE_APPS on the root window.
