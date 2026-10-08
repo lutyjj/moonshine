@@ -1039,7 +1039,8 @@ impl X11Focus {
 		} else {
 			// Use u64 to avoid overflow: raw * 255 can exceed u32::MAX when
 			// raw is close to 0xFFFFFFFF (e.g. 0xFFFFFFFF * 255 = 0xFEFFFFFF01).
-			((raw as u64 * 255) / 0xFFFFFFFF) as u32
+			// Preserve exact transparency when quantizing a visible fade frame.
+			(((raw as u64 * 255) / 0xFFFFFFFF) as u32).max(1)
 		}
 	}
 
