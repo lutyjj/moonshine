@@ -651,11 +651,6 @@ impl VideoPipelineInner {
 	fn create_encoder(&self) -> Result<(VideoContext, Encoder), String> {
 		let ctx = &self.context;
 
-		// Create Vulkan video context.
-		let context = VideoContextBuilder::new()
-			.build()
-			.map_err(|e| format!("Failed to create video context: {e}"))?;
-
 		// Convert our video format to pixelforge's codec.
 		let codec = match ctx.video_format {
 			VideoFormat::H264 => Codec::H264,
@@ -663,6 +658,12 @@ impl VideoPipelineInner {
 			VideoFormat::Av1 => Codec::AV1,
 			VideoFormat::PyroWave => return Err("PyroWave is not encoded by pixelforge".to_string()),
 		};
+
+		// Skip devices that can only decode or cannot encode this session's codec.
+		let context = VideoContextBuilder::new()
+			.require_encode(codec)
+			.build()
+			.map_err(|e| format!("Failed to create video context: {e}"))?;
 
 		// Convert pixel format.
 		let pixel_format = match ctx.chroma_sampling_type {
