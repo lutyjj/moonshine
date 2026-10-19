@@ -39,6 +39,9 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--dump-frame <FILE>` | none | Write the last frame the decode check decoded to a Y4M file (PyroWave only) |
 | `--verbose` | off | Print per-frame stats instead of periodic summary |
 
+`--hdr` creates an HDR-capable session. The application must produce HDR content
+to exercise HDR color conversion.
+
 The decode check fails on missing interior frames or data shards, worker errors,
 and unsuccessful sampled decodes. Partial frames at connection and shutdown are
 excluded. PyroWave runs must decode at least one sample. The check does not recover
@@ -89,13 +92,13 @@ MOONSHINE_LOG=debug moonshine-bench --duration 10 /usr/bin/vkcube
 
 Every 5 seconds, a summary is printed with:
 
-- **Frame count & FPS** — actual encoded frames per second
-- **Bitrate** — average encoded bitrate in Mbps
-- **Total latency** — avg/min/max and p50/p95/p99 time for the full pipeline per frame
-- **Submit latency** — avg/min/max and p50/p95/p99 CPU time spent submitting a frame to the asynchronous encoder
-- **Encode wait latency** — avg/min/max and p50/p95/p99 time waiting for the asynchronous encode/readback future
-- **Breakdown** — avg time per stage: channel wait, DMA-BUF import, color conversion, submit, encode wait, packetization, send; consumer queue is reported as a diagnostic included inside encode wait
-- **Key frames** — number of keyframes emitted
+- **Frame count & FPS**: actual encoded frames per second
+- **Bitrate**: average encoded bitrate in Mbps
+- **Total latency**: avg/min/max and p50/p95/p99 time for the full pipeline per frame
+- **Submit latency**: avg/min/max and p50/p95/p99 CPU time spent submitting a frame to the asynchronous encoder
+- **Encode wait latency**: avg/min/max and p50/p95/p99 time waiting for the asynchronous encode/readback future
+- **Breakdown**: avg time per stage: channel wait, DMA-BUF import, color conversion, submit, encode wait, packetization, send; consumer queue is reported as a diagnostic included inside encode wait
+- **Key frames**: number of keyframes emitted
 
 At the end of the run, a final summary covers the entire session (excluding the warmup period).
 
