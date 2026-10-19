@@ -673,7 +673,18 @@ pub(crate) fn pyrowave_profile(chroma: VideoChromaSampling, range: VideoDynamicR
 
 fn check_vulkan(report: &mut HealthReport) -> Option<VideoContext> {
 	let start = Instant::now();
-	match VideoContextBuilder::new().app_name("Moonshine Health Check").build() {
+	// The default builder also accepts decode-only devices. Accept any of our
+	// encoding codecs, including devices that do not support H.264 encoding.
+	let build = |codec| {
+		VideoContextBuilder::new()
+			.app_name("Moonshine Health Check")
+			.require_encode(codec)
+			.build()
+	};
+	let context = build(Codec::H264)
+		.or_else(|_| build(Codec::H265))
+		.or_else(|_| build(Codec::AV1));
+	match context {
 		Ok(ctx) => {
 			let props = ctx.device_properties();
 			let device_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
