@@ -667,6 +667,7 @@ impl Packetizer {
 mod tests {
 	use super::*;
 	use crate::session::stream::video::pyrowave_framing::FramedPyroWave;
+	use std::collections::BTreeMap;
 
 	#[test]
 	fn coded_frame_fits_one_block_with_parity() {
@@ -835,6 +836,8 @@ mod tests {
 		let mut bytes = Vec::new();
 		let mut last_payload_len = 0;
 		let mut data_packets = 0;
+		let mut highest_block = 0;
+		let mut declared_last_block = None;
 		for wire in batch.as_bytes().chunks_exact(batch.shard_size()) {
 			let packet = if encrypted {
 				let mut data = wire[32..].to_vec();
@@ -850,6 +853,9 @@ mod tests {
 			} else {
 				wire.to_vec()
 			};
+			let last_block = packet[27] >> 6;
+			assert_eq!(*declared_last_block.get_or_insert(last_block), last_block);
+			highest_block = highest_block.max((packet[27] >> 4) & 3);
 			let fec = u32::from_le_bytes(packet[28..32].try_into().unwrap());
 			let index = (fec >> 12) & 0x3ff;
 			let data_count = fec >> 22;
@@ -866,6 +872,7 @@ mod tests {
 			bytes.extend_from_slice(&packet[32..]);
 			data_packets += 1;
 		}
+		assert_eq!(declared_last_block, Some(highest_block));
 		let payload = batch.shard_size() - if encrypted { 64 } else { 32 };
 		bytes.truncate((data_packets - 1) * payload + last_payload_len);
 		bytes.drain(..8);
@@ -930,21 +937,6 @@ mod tests {
 				.is_err()
 		);
 	}
-}
-
-#[cfg(test)]
-mod fec_tests {
-	use super::*;
-	use std::collections::BTreeMap;
-
-	fn packetizer(encrypted: bool) -> Packetizer {
-		let (_, keys) = tokio::sync::watch::channel(crate::session::SessionKeyData {
-			remote_input_key: vec![0x42; 16],
-			remote_input_key_id: 1,
-		});
-		Packetizer::new(encrypted, keys)
-	}
-
 	fn frame(data_shards: usize) -> Vec<u8> {
 		(0..data_shards * 64 - VIDEO_FRAME_HEADER_SIZE)
 			.map(|index| (index % 251) as u8)
@@ -966,45 +958,6 @@ mod fec_tests {
 		assert_eq!(fec_parameters(213, 20, 0), (41, 19));
 		assert_eq!(fec_parameters(1, 20, 2), (2, 101));
 		assert_eq!(fec_parameters(1, 20, u32::MAX), (3, 255));
-	}
-
-	fn reassemble(batch: &ShardBatch, encrypted: bool) -> Vec<u8> {
-		let cipher = Aes128Gcm::new_from_slice(&[0x42; 16]).unwrap();
-		let mut bytes = Vec::new();
-		let mut last_payload = 0;
-		let mut data_packets = 0;
-		let mut highest_block = 0;
-		let mut declared_last_block = None;
-		for wire in batch.as_bytes().chunks_exact(batch.shard_size()) {
-			let mut packet = if encrypted { wire[32..].to_vec() } else { wire.to_vec() };
-			if encrypted {
-				cipher
-					.decrypt_in_place_detached(
-						Nonce::from_slice(&wire[..12]),
-						b"",
-						&mut packet,
-						aes_gcm::Tag::from_slice(&wire[16..32]),
-					)
-					.unwrap();
-			}
-			let last_block = packet[27] >> 6;
-			assert_eq!(*declared_last_block.get_or_insert(last_block), last_block);
-			highest_block = highest_block.max((packet[27] >> 4) & 3);
-			let fec = u32::from_le_bytes(packet[28..32].try_into().unwrap());
-			if (fec >> 12) & 0x3ff >= fec >> 22 {
-				continue;
-			}
-			if data_packets == 0 {
-				last_payload = u32::from_le_bytes(packet[36..40].try_into().unwrap()) as usize;
-			}
-			bytes.extend_from_slice(&packet[32..]);
-			data_packets += 1;
-		}
-		assert_eq!(declared_last_block, Some(highest_block));
-		let payload = batch.shard_size() - if encrypted { 64 } else { 32 };
-		bytes.truncate((data_packets - 1) * payload + last_payload);
-		bytes.drain(..8);
-		bytes
 	}
 
 	#[test]
