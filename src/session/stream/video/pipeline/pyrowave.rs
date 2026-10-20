@@ -7,7 +7,7 @@
 //! key frame, so IDR and reference invalidation requests need no encoder work.
 
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -15,9 +15,10 @@ use std::time::{Duration, Instant};
 use ash::vk;
 use async_shutdown::ShutdownManager;
 use bytes::Bytes;
+use pyrowave::sys as ffi;
 use pyrowave::{
-	ChromaSampling, Device, DmabufDescriptor, Encoder, ImportedImage, InputColorSpace, IntermediatePrecision,
-	OutputColorSpace, RgbFormat, ScaleConfig, VideoFormat,
+	ChromaSampling, Device, Encoder, ImportedImage, InputColorSpace, IntermediatePrecision, OutputColorSpace,
+	ScaleConfig, VideoFormat,
 };
 use smithay::backend::allocator::{Buffer, dmabuf::Dmabuf};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -39,7 +40,8 @@ struct Import {
 	params: ImportParams,
 	/// A dup of the exporter's fd, compared with `kcmp(2)` to catch fd recycling.
 	identity: OwnedFd,
-	image: ImportedImage,
+	/// `None` after a failed import, so the same buffer is not retried.
+	image: Option<ImportedImage>,
 	last_used: Instant,
 }
 
@@ -89,28 +91,26 @@ impl PyroWaveEncoder {
 		})
 	}
 
-	pub fn import(&mut self, dmabuf: &Dmabuf) -> Result<(), pyrowave::Error> {
-		if dmabuf.num_planes() != 1 {
-			return Err(pyrowave::Error::InvalidInput("PyroWave requires one packed RGB plane"));
-		}
-		let plane = DmaBufPlane {
-			fd: dmabuf.handles().next().expect("one plane").as_raw_fd(),
-			offset: dmabuf.offsets().next().expect("one plane"),
-			stride: dmabuf.strides().next().expect("one plane"),
-			modifier: u64::from(dmabuf.format().modifier),
-		};
-		let (_, vk_format) = drm_fourcc_to_input(dmabuf.format().code as u32);
-		let params = ImportParams::new(
-			dmabuf.width(),
-			dmabuf.height(),
-			vk_format,
-			&[DmaBufPlane {
-				fd: plane.fd,
-				offset: plane.offset,
-				stride: plane.stride,
+	pub fn import(&mut self, dmabuf: &Dmabuf) -> Result<(), String> {
+		// Modifiers with compression metadata (AMD DCC) add memory planes to the
+		// packed RGB image. They are imported through the first plane's buffer.
+		let planes: Vec<_> = dmabuf
+			.handles()
+			.zip(dmabuf.offsets())
+			.zip(dmabuf.strides())
+			.map(|((fd, offset), stride)| DmaBufPlane {
+				fd: fd.as_raw_fd(),
+				offset,
+				stride,
 				modifier: u64::from(dmabuf.format().modifier),
-			}],
-		);
+			})
+			.collect();
+		let plane = planes[0];
+		if planes.len() > 4 || planes.iter().any(|p| !same_open_file(p.fd, plane.fd)) {
+			return Err("PyroWave requires all planes in one buffer".to_string());
+		}
+		let (_, vk_format) = drm_fourcc_to_input(dmabuf.format().code as u32);
+		let params = ImportParams::new(dmabuf.width(), dmabuf.height(), vk_format, &planes);
 		let now = Instant::now();
 		self.imports
 			.retain(|fd, import| *fd == plane.fd || now.duration_since(import.last_used) < IMPORT_IDLE_EVICTION);
@@ -119,38 +119,82 @@ impl PyroWaveEncoder {
 			&& same_open_file(import.identity.as_raw_fd(), plane.fd)
 		{
 			import.last_used = now;
-			return Ok(());
+			return match import.image {
+				Some(_) => Ok(()),
+				None => Err("PyroWave could not import this buffer".to_string()),
+			};
 		}
 
 		// A recycled fd or a changed layout.
 		self.imports.remove(&plane.fd);
 
+		if !matches!(
+			vk_format,
+			vk::Format::R8G8B8A8_UNORM
+				| vk::Format::A2B10G10R10_UNORM_PACK32
+				| vk::Format::R16G16B16A16_SFLOAT
+				| vk::Format::B8G8R8A8_UNORM
+		) {
+			return Err("PyroWave cannot scale this buffer format".to_string());
+		}
 		// SAFETY: the exported buffer is retained until this frame is consumed.
 		let borrowed = unsafe { BorrowedFd::borrow_raw(plane.fd) };
-		let identity = borrowed.try_clone_to_owned()?;
-		let format = match vk_format {
-			vk::Format::R8G8B8A8_UNORM => RgbFormat::Rgba8,
-			vk::Format::A2B10G10R10_UNORM_PACK32 => RgbFormat::Rgb10A2,
-			vk::Format::R16G16B16A16_SFLOAT => RgbFormat::Rgba16Float,
-			vk::Format::B8G8R8A8_UNORM => RgbFormat::Bgra8,
-			_ => {
-				return Err(pyrowave::Error::InvalidInput(
-					"PyroWave cannot scale this buffer format",
-				));
+		let identity = borrowed.try_clone_to_owned().map_err(|e| e.to_string())?;
+		let handed_over = borrowed.try_clone_to_owned().map_err(|e| e.to_string())?;
+		let layouts: Vec<_> = planes
+			.iter()
+			.map(|p| ffi::VkSubresourceLayout {
+				offset: p.offset.into(),
+				rowPitch: p.stride.into(),
+				..Default::default()
+			})
+			.collect();
+		let modifier = ffi::VkImageDrmFormatModifierExplicitCreateInfoEXT {
+			sType: ffi::VkStructureType_VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+			drmFormatModifier: plane.modifier,
+			drmFormatModifierPlaneCount: layouts.len() as u32,
+			pPlaneLayouts: layouts.as_ptr(),
+			..Default::default()
+		};
+		let create_info = ffi::VkImageCreateInfo {
+			sType: ffi::VkStructureType_VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+			pNext: (&raw const modifier).cast(),
+			imageType: ffi::VkImageType_VK_IMAGE_TYPE_2D,
+			format: vk_format.as_raw() as ffi::VkFormat,
+			extent: ffi::VkExtent3D {
+				width: dmabuf.width(),
+				height: dmabuf.height(),
+				depth: 1,
 			},
+			mipLevels: 1,
+			arrayLayers: 1,
+			samples: ffi::VkSampleCountFlagBits_VK_SAMPLE_COUNT_1_BIT,
+			tiling: ffi::VkImageTiling_VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+			usage: ffi::VkImageUsageFlagBits_VK_IMAGE_USAGE_SAMPLED_BIT,
+			sharingMode: ffi::VkSharingMode_VK_SHARING_MODE_EXCLUSIVE,
+			initialLayout: ffi::VkImageLayout_VK_IMAGE_LAYOUT_UNDEFINED,
+			..Default::default()
 		};
-		let descriptor = DmabufDescriptor {
-			width: dmabuf.width(),
-			height: dmabuf.height(),
-			format,
-			modifier: u64::from(dmabuf.format().modifier),
-			offset: plane.offset.into(),
-			row_stride: plane.stride.into(),
+		let info = ffi::pyrowave_image_create_info {
+			device: self.encoder.device().as_raw(),
+			// Vulkan consumes the descriptor only if its memory import succeeds, and
+			// a failure does not report whether that happened. Closing it afterwards
+			// could close a recycled descriptor, so a failed import leaks it once and
+			// is remembered below instead of being retried every frame.
+			external_handle: handed_over.into_raw_fd() as ffi::pyrowave_os_handle,
+			handle_type: ffi::VkExternalMemoryHandleTypeFlagBits_VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+			image_create_info: &create_info,
 		};
-		// SAFETY: the compositor supplied the allocation's exact layout. It keeps
-		// the buffer alive until the synchronous encode releases it.
-		let image = unsafe { self.encoder.device().import_dmabuf(borrowed, descriptor) }?;
-		tracing::debug!(fd = plane.fd, ?params, "Imported compositor buffer into PyroWave");
+		let mut handle = std::ptr::null_mut();
+		// SAFETY: the compositor supplied the allocation's exact layout, and the
+		// create infos outlive the call.
+		let created = pyrowave::with_native(|| unsafe { ffi::pyrowave_image_create(&info, &mut handle) });
+		let image = if created == ffi::pyrowave_result_PYROWAVE_SUCCESS {
+			// SAFETY: the image was created on the encoder's device and has no other owner.
+			Some(unsafe { ImportedImage::from_raw(self.encoder.device().clone(), handle) }.map_err(|e| e.to_string())?)
+		} else {
+			None
+		};
 		self.imports.insert(
 			plane.fd,
 			Import {
@@ -160,6 +204,10 @@ impl PyroWaveEncoder {
 				last_used: now,
 			},
 		);
+		if self.imports[&plane.fd].image.is_none() {
+			return Err(format!("PyroWave DMA-BUF import failed with {created}"));
+		}
+		tracing::debug!(fd = plane.fd, ?params, "Imported compositor buffer into PyroWave");
 		Ok(())
 	}
 
@@ -171,7 +219,10 @@ impl PyroWaveEncoder {
 		output_hdr: bool,
 		budget: usize,
 	) -> Result<&[u8], pyrowave::Error> {
-		let image = &self.imports[&dmabuf.handles().next().expect("imported plane").as_raw_fd()].image;
+		let image = self.imports[&dmabuf.handles().next().expect("imported plane").as_raw_fd()]
+			.image
+			.as_ref()
+			.expect("accepted import");
 		let scale = ScaleConfig {
 			input_color_space: match input {
 				FrameColorSpace::Srgb => InputColorSpace::Srgb,
@@ -200,8 +251,8 @@ pub(crate) fn probe(dmabuf: &Dmabuf, chroma: VideoChromaSampling, range: VideoDy
 		..Default::default()
 	};
 	PyroWaveEncoder::new(&ctx)
-		.and_then(|mut encoder| encoder.import(dmabuf))
 		.map_err(|error| error.to_string())
+		.and_then(|mut encoder| encoder.import(dmabuf))
 }
 
 fn frame_budget(bitrate: usize, fps: u32, capacity: usize) -> usize {
