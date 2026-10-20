@@ -18,7 +18,7 @@ use bytes::Bytes;
 use pyrowave::sys as ffi;
 use pyrowave::{
 	ChromaSampling, Device, Encoder, ImportedImage, InputColorSpace, IntermediatePrecision, OutputColorSpace,
-	ScaleConfig, VideoFormat,
+	ScaleConfig, VideoFormat, YcbcrRange,
 };
 use smithay::backend::allocator::{Buffer, dmabuf::Dmabuf};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -52,6 +52,8 @@ const IMPORT_IDLE_EVICTION: Duration = Duration::from_secs(5);
 pub(super) struct PyroWaveEncoder {
 	encoder: Encoder,
 	intermediate_precision: IntermediatePrecision,
+	chroma_midpoint: f32,
+	range: YcbcrRange,
 	critical_blocks: usize,
 	imports: HashMap<RawFd, Import>,
 }
@@ -65,6 +67,14 @@ impl PyroWaveEncoder {
 		let intermediate_precision = match ctx.dynamic_range {
 			VideoDynamicRange::Sdr => IntermediatePrecision::Unorm8,
 			VideoDynamicRange::Hdr => IntermediatePrecision::Unorm16,
+		};
+		// Narrow range uses the profile's bit depth and its midpoint. Full range
+		// keeps the midpoints these streams have always used.
+		let (range, chroma_midpoint) = match (ctx.dynamic_range, ctx.full_range) {
+			(VideoDynamicRange::Sdr, true) => (YcbcrRange::Full, 128.0 / 255.0),
+			(VideoDynamicRange::Hdr, true) => (YcbcrRange::Full, 0.5),
+			(VideoDynamicRange::Sdr, false) => (YcbcrRange::Narrow { bit_depth: 8 }, 128.0 / 255.0),
+			(VideoDynamicRange::Hdr, false) => (YcbcrRange::Narrow { bit_depth: 10 }, 512.0 / 1023.0),
 		};
 		let device = Device::new()?;
 		let encoder = Encoder::new(
@@ -81,11 +91,14 @@ impl PyroWaveEncoder {
 			height = ctx.height,
 			chroma = ?ctx.chroma_sampling_type,
 			dynamic_range = ?ctx.dynamic_range,
+			full_range = ctx.full_range,
 			"Created PyroWave encoder"
 		);
 		Ok(Self {
 			encoder,
 			intermediate_precision,
+			chroma_midpoint,
+			range,
 			critical_blocks,
 			imports: HashMap::new(),
 		})
@@ -235,6 +248,8 @@ impl PyroWaveEncoder {
 				OutputColorSpace::Srgb
 			},
 			intermediate_precision: self.intermediate_precision,
+			chroma_midpoint: self.chroma_midpoint,
+			range: self.range,
 		};
 		// SAFETY: the frame's storage is a DMA-BUF owned outside this device, and
 		// the caller retains it until this synchronous encode completes.

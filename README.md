@@ -9,7 +9,7 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 
 - **Isolated streaming sessions**: Each stream runs in its own compositor, completely separate from your desktop environment. Your host PC can still be used for other things while you stream.
 - **No monitor required**: Works on headless servers without an HDMI dummy plug.
-- **GPU video encoding**: H.264, H.265, AV1, and PyroWave. PyroWave requires a compatible Moonlight client and full-range video.
+- **GPU video encoding**: H.264, H.265, AV1, and PyroWave. PyroWave requires a compatible Moonlight client.
 - **HDR support**: True 10-bit HDR streaming for supported games.
 - **Full input support**: Mouse, keyboard, touchscreen, pen/stylus, and gamepad (including motion, touchpad, and haptics).
 - **Audio streaming**: Stereo and surround sound (5.1/7.1) with low-latency Opus encoding.
