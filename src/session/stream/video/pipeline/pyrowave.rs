@@ -18,7 +18,7 @@ use bytes::Bytes;
 use pyrowave::sys as ffi;
 use pyrowave::{
 	ChromaSampling, Device, Encoder, ImportedImage, InputColorSpace, IntermediatePrecision, OutputColorSpace,
-	ScaleConfig, VideoFormat, YcbcrRange,
+	QueueType, ScaleConfig, VideoFormat, YcbcrRange,
 };
 use smithay::backend::allocator::{Buffer, dmabuf::Dmabuf};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -77,6 +77,9 @@ impl PyroWaveEncoder {
 			(VideoDynamicRange::Hdr, false) => (YcbcrRange::Narrow { bit_depth: 10 }, 512.0 / 1023.0),
 		};
 		let device = Device::new()?;
+		// Upstream suggests async compute for encoding outside the producing
+		// process: a game keeps the graphics queue busy.
+		device.set_queue_type(QueueType::Compute)?;
 		let encoder = Encoder::new(
 			device,
 			VideoFormat {
