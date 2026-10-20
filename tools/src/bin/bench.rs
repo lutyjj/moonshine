@@ -619,7 +619,7 @@ async fn run_benchmark(
 			VideoChromaSampling::Yuv420
 		},
 		max_reference_frames: 1,
-		// PyroWave encodes full range, which Moonlight's Vulkan renderer requests.
+		// PyroWave sessions use full range, which Moonlight's Vulkan renderer requests.
 		full_range: video_format == VideoFormat::PyroWave,
 		encrypt_video: false,
 	};

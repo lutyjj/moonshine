@@ -417,10 +417,6 @@ impl RtspServer {
 		const CSC_COLORSPACE_REC709: u32 = 1;
 		let encoder_csc_mode: Option<u32> = get_optional_sdp_attribute(&sdp_session, "x-nv-video[0].encoderCscMode");
 		let full_range = encoder_csc_mode.unwrap_or_default() & 0x1 != 0;
-		if video_format == VideoFormat::PyroWave && !full_range {
-			tracing::warn!("PyroWave requires full-range video.");
-			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
-		}
 
 		// Only Rec.709 is encoded. Rec.601 doubles as the protocol default for
 		// clients that never chose a colorspace, so it stays quiet; higher
@@ -719,14 +715,15 @@ mod tests {
 	async fn announce_rejects_unsupported_pyrowave_requests() {
 		let mut server = test_server();
 		for (format, available, framing, csc, expected) in [
-			(3, true, true, Some(0), rtsp_types::StatusCode::BadRequest),
-			(3, true, true, Some(2), rtsp_types::StatusCode::BadRequest),
-			(3, true, true, None, rtsp_types::StatusCode::BadRequest),
 			(3, false, true, Some(3), rtsp_types::StatusCode::BadRequest),
 			(3, true, false, Some(3), rtsp_types::StatusCode::BadRequest),
-			// Valid negotiation reaches the session manager, which has no launched session.
+			// Valid negotiation, in full or limited range, reaches the session
+			// manager, which has no launched session.
 			(3, true, true, Some(3), rtsp_types::StatusCode::InternalServerError),
 			(3, true, true, Some(1), rtsp_types::StatusCode::InternalServerError),
+			(3, true, true, Some(0), rtsp_types::StatusCode::InternalServerError),
+			(3, true, true, Some(2), rtsp_types::StatusCode::InternalServerError),
+			(3, true, true, None, rtsp_types::StatusCode::InternalServerError),
 			(0, false, false, Some(2), rtsp_types::StatusCode::InternalServerError),
 			(1, false, false, Some(2), rtsp_types::StatusCode::InternalServerError),
 			(2, false, false, Some(2), rtsp_types::StatusCode::InternalServerError),

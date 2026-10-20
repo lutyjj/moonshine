@@ -2996,7 +2996,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 [[package]]
 name = "pyrowave"
 version = "0.1.0"
-source = "git+https://github.com/lutyjj/pyrowave-rs?rev=d8227621cd728d2c6f919233d16068f18435e209#d8227621cd728d2c6f919233d16068f18435e209"
+source = "git+https://github.com/lutyjj/pyrowave-rs?rev=3c3985ff024b96bc074e82a75bcd673ac27b2209#3c3985ff024b96bc074e82a75bcd673ac27b2209"
 dependencies = [
  "pyrowave-sys",
  "thiserror 2.0.19",
@@ -3005,7 +3005,7 @@ dependencies = [
 [[package]]
 name = "pyrowave-sys"
 version = "0.1.0"
-source = "git+https://github.com/lutyjj/pyrowave-rs?rev=d8227621cd728d2c6f919233d16068f18435e209#d8227621cd728d2c6f919233d16068f18435e209"
+source = "git+https://github.com/lutyjj/pyrowave-rs?rev=3c3985ff024b96bc074e82a75bcd673ac27b2209#3c3985ff024b96bc074e82a75bcd673ac27b2209"
 dependencies = [
  "bindgen 0.73.2",
  "cmake",
