@@ -129,7 +129,7 @@ rustPlatform.buildRustPackage {
   cargoLock = {
     lockFile = ../Cargo.lock;
     allowBuiltinFetchGit = true;
-    outputHashes."pyrowave-0.1.0" = "sha256-1QdoD3HVMm642fh8Nbiq/rJw/Se8Tjxjkesmu9EAO2M=";
+    outputHashes."pyrowave-0.1.0" = "sha256-JGTaKSPyrqHYEol/a+1Hf7Cl8Tx2WBWE0CO73SBlJsA=";
   };
 
   # The inputtino graft described above. The cargo setup hook has already
