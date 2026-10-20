@@ -297,7 +297,9 @@ fn decode_frames(stream: PyroWaveStream, frames: mpsc::Receiver<Vec<u8>>) -> io:
 		// the decoder would discard it as already seen.
 		decoder.clear();
 		let ok = strip_padding_records(&frame).is_some_and(|records| {
-			decoder.push_packet(&records).is_ok()
+			// SAFETY: only complete frames arrive here, and their records come from
+			// the host's encoder for this stream's format.
+			unsafe { decoder.push_packet(&records) }.is_ok()
 				&& decoder.is_ready(false)
 				&& decoder.decode_cpu(planes.each_mut().map(Vec::as_mut_slice)).is_ok()
 		});

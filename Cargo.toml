@@ -3,7 +3,7 @@ members = [".", "tools"]
 resolver = "2"
 
 [workspace.dependencies]
-pyrowave = { git = "https://github.com/lutyjj/pyrowave-rs", rev = "d5a249c7aa8472b1c6f289b90c11a871c73ea17b" }
+pyrowave = { git = "https://github.com/lutyjj/pyrowave-rs", rev = "d8227621cd728d2c6f919233d16068f18435e209" }
 
 [workspace.package]
 version = "0.16.1"
