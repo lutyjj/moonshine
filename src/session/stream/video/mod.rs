@@ -14,6 +14,7 @@ use crate::session::stream::{StartSignal, StartWaiter};
 mod gso_socket;
 mod packetizer;
 mod pipeline;
+pub(crate) use pipeline::importable_formats;
 mod shard_batch;
 use gso_socket::UdpGsoSocket;
 use pipeline::VideoPipeline;

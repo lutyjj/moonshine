@@ -21,7 +21,7 @@
 //! The startup healthcheck verifies `kcmp(2)` is available; startup is refused
 //! without it.
 
-use ash::vk;
+use ash::vk::{self, TaggedStructure as _};
 use pixelforge::VideoContext;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -36,6 +36,137 @@ const CACHE_TTL: Duration = Duration::from_secs(2);
 
 /// Sweep for stale entries every N `import_or_reuse` calls.
 const SWEEP_INTERVAL_CALLS: u32 = 60;
+
+/// How a frame is imported: the usage and sharing of its image, which
+/// [`importable_formats`] must ask the device about too.
+const IMPORT_USAGE: vk::ImageUsageFlags =
+	vk::ImageUsageFlags::from_raw(vk::ImageUsageFlags::TRANSFER_SRC.as_raw() | vk::ImageUsageFlags::SAMPLED.as_raw());
+const IMPORT_SHARING: vk::SharingMode = vk::SharingMode::EXCLUSIVE;
+
+/// The frame formats the compositor may allocate, as DRM fourccs: the SDR,
+/// PQ and scRGB layouts the encoder imports.
+const FRAME_FOURCCS: [ferriscope::Fourcc; 8] = [
+	ferriscope::Fourcc::Abgr8888,
+	ferriscope::Fourcc::Xbgr8888,
+	ferriscope::Fourcc::Argb8888,
+	ferriscope::Fourcc::Xrgb8888,
+	ferriscope::Fourcc::Abgr2101010,
+	ferriscope::Fourcc::Xbgr2101010,
+	ferriscope::Fourcc::Abgr16161616f,
+	ferriscope::Fourcc::Xbgr16161616f,
+];
+
+/// The DMA-BUF formats and modifiers the encoder can import frames of
+/// `width`x`height` in, on the Vulkan device behind `render_node`.
+///
+/// A frame is imported as an image with an explicit DRM format modifier and
+/// [`IMPORT_USAGE`], which Vulkan allows only for the modifiers the device
+/// lists for the format and reports importable. A GL driver can render into
+/// others: NVIDIA's compressed block-linear layouts, for one.
+pub(crate) fn importable_formats(
+	render_node: &std::path::Path,
+	width: u32,
+	height: u32,
+) -> Result<Vec<ferriscope::Format>, String> {
+	use std::os::unix::fs::MetadataExt as _;
+
+	let rdev = std::fs::metadata(render_node)
+		.map_err(|e| format!("{}: {e}", render_node.display()))?
+		.rdev();
+	let node = (i64::from(libc::major(rdev)), i64::from(libc::minor(rdev)));
+	// SAFETY: loading the system Vulkan loader, as the encoders do.
+	let entry = unsafe { ash::Entry::load() }.map_err(|e| format!("load Vulkan: {e}"))?;
+	let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
+	// SAFETY: a plain instance, destroyed before returning.
+	let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None) }
+		.map_err(|e| format!("create Vulkan instance: {e}"))?;
+	let formats = device_for_node(&instance, node)
+		.ok_or_else(|| format!("no Vulkan device for {}", render_node.display()))
+		.map(|gpu| importable_on(&instance, gpu, width, height));
+	// SAFETY: nothing created from the instance outlives this call.
+	unsafe { instance.destroy_instance(None) };
+	formats
+}
+
+/// The physical device whose render node is `node` (major, minor).
+fn device_for_node(instance: &ash::Instance, node: (i64, i64)) -> Option<vk::PhysicalDevice> {
+	// SAFETY: queries on a live instance.
+	unsafe { instance.enumerate_physical_devices() }
+		.ok()?
+		.into_iter()
+		.find(|&gpu| {
+			let has_drm = unsafe { instance.enumerate_device_extension_properties(gpu) }.is_ok_and(|extensions| {
+				extensions
+					.iter()
+					.any(|ext| ext.extension_name_as_c_str() == Ok(ash::ext::physical_device_drm::NAME))
+			});
+			if !has_drm {
+				return false;
+			}
+			let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
+			let mut properties = vk::PhysicalDeviceProperties2::default().push(&mut drm);
+			unsafe { instance.get_physical_device_properties2(gpu, &mut properties) };
+			drm.has_render == vk::TRUE && (drm.render_major, drm.render_minor) == node
+		})
+}
+
+/// Every modifier of [`FRAME_FOURCCS`] that `gpu` imports from a DMA-BUF at
+/// `width`x`height` for the encoders' use.
+fn importable_on(
+	instance: &ash::Instance,
+	gpu: vk::PhysicalDevice,
+	width: u32,
+	height: u32,
+) -> Vec<ferriscope::Format> {
+	let mut formats = Vec::new();
+	for code in FRAME_FOURCCS {
+		let (_, format) = super::drm_fourcc_to_input(code as u32);
+		for modifier in format_modifiers(instance, gpu, format) {
+			let mut drm = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+				.drm_format_modifier(modifier)
+				.sharing_mode(IMPORT_SHARING);
+			let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
+				.handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+			let info = vk::PhysicalDeviceImageFormatInfo2::default()
+				.format(format)
+				.ty(vk::ImageType::TYPE_2D)
+				.tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+				.usage(IMPORT_USAGE)
+				.push(&mut external)
+				.push(&mut drm);
+			let mut external_properties = vk::ExternalImageFormatProperties::default();
+			let mut properties = vk::ImageFormatProperties2::default().push(&mut external_properties);
+			// SAFETY: a query on a live physical device.
+			let supported =
+				unsafe { instance.get_physical_device_image_format_properties2(gpu, &info, &mut properties) }.is_ok();
+			let extent = properties.image_format_properties.max_extent;
+			let importable = external_properties
+				.external_memory_properties
+				.external_memory_features
+				.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
+			if supported && importable && extent.width >= width && extent.height >= height {
+				formats.push(ferriscope::Format {
+					code,
+					modifier: ferriscope::Modifier::from(modifier),
+				});
+			}
+		}
+	}
+	formats
+}
+
+/// The DRM format modifiers `gpu` lists for `format`.
+fn format_modifiers(instance: &ash::Instance, gpu: vk::PhysicalDevice, format: vk::Format) -> Vec<u64> {
+	let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+	let mut properties = vk::FormatProperties2::default().push(&mut list);
+	// SAFETY: queries on a live physical device; the second fills the first's count.
+	unsafe { instance.get_physical_device_format_properties2(gpu, format, &mut properties) };
+	let mut modifiers = vec![vk::DrmFormatModifierPropertiesEXT::default(); list.drm_format_modifier_count as usize];
+	let mut list = vk::DrmFormatModifierPropertiesListEXT::default().drm_format_modifier_properties(&mut modifiers);
+	let mut properties = vk::FormatProperties2::default().push(&mut list);
+	unsafe { instance.get_physical_device_format_properties2(gpu, format, &mut properties) };
+	modifiers.iter().map(|modifier| modifier.drm_format_modifier).collect()
+}
 
 /// A single DMA-BUF plane descriptor.
 #[derive(Debug, Clone, Copy)]
@@ -329,8 +460,8 @@ impl DmaBufImporter {
 			.array_layers(1)
 			.samples(vk::SampleCountFlags::TYPE_1)
 			.tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-			.usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED)
-			.sharing_mode(vk::SharingMode::EXCLUSIVE)
+			.usage(IMPORT_USAGE)
+			.sharing_mode(IMPORT_SHARING)
 			.initial_layout(vk::ImageLayout::UNDEFINED);
 		image_create_info.p_next = &mut external_memory_info as *mut vk::ExternalMemoryImageCreateInfo as *mut _;
 
@@ -415,6 +546,21 @@ mod tests {
 	use super::{DmaBufPlane, ImportParams, same_open_file};
 	use ash::vk;
 	use std::os::fd::AsRawFd;
+
+	/// A smoke check of the query on a real GPU: it finds the device behind the
+	/// node and an importable 8-bit layout. Which layouts a driver lists is the
+	/// driver's to say.
+	#[test]
+	#[ignore = "manual: needs the GPU behind MOONSHINE_RENDER_NODE or renderD128"]
+	fn the_gpu_imports_an_8bit_layout() {
+		let node =
+			std::env::var_os("MOONSHINE_RENDER_NODE").map_or("/dev/dri/renderD128".into(), std::path::PathBuf::from);
+		let formats = super::importable_formats(&node, 3840, 2160).expect("query the GPU");
+		assert!(
+			formats.iter().any(|format| format.code == ferriscope::Fourcc::Abgr8888),
+			"an 8-bit layout: {formats:?}"
+		);
+	}
 
 	fn plane(offset: u32, stride: u32) -> DmaBufPlane {
 		DmaBufPlane {

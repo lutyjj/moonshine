@@ -4,6 +4,7 @@
 //! and packetization for network transmission.
 
 mod dmabuf;
+pub(crate) use dmabuf::importable_formats;
 mod fence;
 mod hdr_sei;
 
