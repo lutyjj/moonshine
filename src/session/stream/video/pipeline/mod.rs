@@ -411,6 +411,31 @@ async fn run_packet_consumer(
 			);
 		}
 
+		// Every frame, for matching against a client's record of the same stream:
+		// the frame number and RTP timestamp it was sent with, its capture time
+		// from the epoch the RTP timestamps count from, and the spike breakdown.
+		// A target of its own, so enabling it turns on no other per-frame log,
+		// such as this module's, which would add to the times it reports.
+		tracing::trace!(
+			target: "moonshine::frame_latency",
+			frame_number,
+			rtp_timestamp,
+			since_epoch_us = since_epoch.as_micros() as u64,
+			total_us = stats.total.as_micros() as u64,
+			channel_us = stats.channel_wait.as_micros() as u64,
+			import_us = stats.import.as_micros() as u64,
+			convert_us = stats.convert.as_micros() as u64,
+			submit_us = stats.submit.as_micros() as u64,
+			consumer_queue_us = stats.consumer_queue.as_micros() as u64,
+			encode_wait_us = stats.encode_wait.as_micros() as u64,
+			packetize_us = stats.packetize.as_micros() as u64,
+			send_us = stats.send.as_micros() as u64,
+			encoded_bytes,
+			is_key_frame,
+			sequence = frame_context.sequence,
+			"Frame latency"
+		);
+
 		let _ = stats_tx.send(stats.clone());
 		latency_samples.push(stats);
 
