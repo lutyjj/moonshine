@@ -11,7 +11,7 @@ use pixelforge::{Codec, EncodeBitDepth, PixelFormat, VideoContext, VideoContextB
 use crate::config::Config;
 use crate::session::stream::video::{VideoChromaSampling, VideoDynamicRange};
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
-use smithay::backend::allocator::{Allocator, Format, Fourcc, dmabuf::AsDmabuf, format::FormatSet};
+use smithay::backend::allocator::{Allocator, Format, Fourcc, Modifier, dmabuf::AsDmabuf, format::FormatSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckOutcome {
@@ -570,26 +570,37 @@ fn check_egl(report: &mut HealthReport, node: Option<&PathBuf>) -> Option<(Strin
 	Some((gpu_name, hdr_supported, render_formats.clone()))
 }
 
-/// Probe the pool layouts Ferriscope can select: SDR plus PQ and scRGB in HDR
-/// sessions. Each group follows ferriscope-core's render-format preference.
-fn pyrowave_capture_formats(formats: &FormatSet, hdr: bool) -> Vec<Format> {
+/// The pool layouts a session can get: SDR, plus PQ and scRGB in HDR
+/// sessions, each a fourcc with the modifiers the renderer draws into and the
+/// encoder imports, which the allocator picks from. Each group follows
+/// Ferriscope's preference.
+fn pyrowave_capture_formats(
+	formats: &FormatSet,
+	importable: Option<&[Format]>,
+	hdr: bool,
+) -> Vec<(Fourcc, Vec<Modifier>)> {
+	let usable = |code: Fourcc| {
+		let modifiers: Vec<Modifier> = formats
+			.iter()
+			.filter(|format| format.code == code && format.modifier != Modifier::Invalid)
+			.filter(|format| importable.is_none_or(|importable| importable.contains(format)))
+			.map(|format| format.modifier)
+			.collect();
+		(!modifiers.is_empty()).then_some((code, modifiers))
+	};
 	let mut selected = Vec::new();
-	let sdr = [Fourcc::Abgr8888, Fourcc::Argb8888, Fourcc::Xrgb8888]
-		.into_iter()
-		.find_map(|code| formats.iter().find(|format| format.code == code))
-		.or_else(|| formats.iter().next());
-	selected.extend(sdr.copied());
+	selected.extend(
+		[Fourcc::Abgr8888, Fourcc::Xbgr8888, Fourcc::Argb8888, Fourcc::Xrgb8888]
+			.into_iter()
+			.chain(formats.iter().next().map(|format| format.code))
+			.find_map(usable),
+	);
 	if hdr {
 		for codes in [
 			[Fourcc::Abgr2101010, Fourcc::Xbgr2101010],
 			[Fourcc::Abgr16161616f, Fourcc::Xbgr16161616f],
 		] {
-			selected.extend(
-				codes
-					.into_iter()
-					.find_map(|code| formats.iter().find(|format| format.code == code))
-					.copied(),
-			);
+			selected.extend(codes.into_iter().find_map(usable));
 		}
 	}
 	selected
@@ -605,10 +616,14 @@ fn check_pyrowave(report: &mut HealthReport, node: &Path, formats: &FormatSet) -
 			.map_err(|e| e.to_string())?;
 		let device = GbmDevice::new(fd).map_err(|e| e.to_string())?;
 		let mut allocator = GbmAllocator::new(device, GbmBufferFlags::RENDERING);
+		// The layouts sessions are allocated in (see `Compositor::launch`).
+		let importable = crate::session::stream::video::importable_formats(node, 256, 256)
+			.ok()
+			.filter(|formats| !formats.is_empty());
 		let mut supported = 0;
 		for range in [VideoDynamicRange::Sdr, VideoDynamicRange::Hdr] {
 			let hdr = range == VideoDynamicRange::Hdr;
-			let targets = pyrowave_capture_formats(formats, hdr);
+			let targets = pyrowave_capture_formats(formats, importable.as_deref(), hdr);
 			if targets.is_empty() {
 				continue;
 			}
@@ -617,9 +632,9 @@ fn check_pyrowave(report: &mut HealthReport, node: &Path, formats: &FormatSet) -
 			}
 			let buffers = targets
 				.iter()
-				.map(|format| {
+				.map(|(code, modifiers)| {
 					allocator
-						.create_buffer(256, 256, format.code, &[format.modifier])
+						.create_buffer(256, 256, *code, modifiers)
 						.map_err(|e| e.to_string())
 						.and_then(|buffer| buffer.export().map_err(|e| e.to_string()))
 				})
@@ -1435,15 +1450,39 @@ mod tests {
 		})
 		.collect();
 		let codes = |hdr| {
-			pyrowave_capture_formats(&formats, hdr)
+			pyrowave_capture_formats(&formats, None, hdr)
 				.into_iter()
-				.map(|format| format.code)
+				.map(|(code, _)| code)
 				.collect::<Vec<_>>()
 		};
 		assert_eq!(codes(false), [Fourcc::Abgr8888]);
 		assert_eq!(
 			codes(true),
 			[Fourcc::Abgr8888, Fourcc::Abgr2101010, Fourcc::Abgr16161616f]
+		);
+	}
+
+	#[test]
+	fn pyrowave_probe_uses_only_layouts_the_encoder_imports() {
+		const COMPRESSED: u64 = 0x0300_0000_00e0_8014;
+		const BLOCK_LINEAR: u64 = 0x0300_0000_0060_6010;
+		let format = |code, modifier: u64| Format {
+			code,
+			modifier: Modifier::from(modifier),
+		};
+		let renderable: FormatSet = [
+			format(Fourcc::Abgr8888, COMPRESSED),
+			format(Fourcc::Argb8888, COMPRESSED),
+			format(Fourcc::Argb8888, BLOCK_LINEAR),
+		]
+		.into_iter()
+		.collect();
+		// ABGR8888 renders only into a layout the encoder rejects, so the
+		// probe takes ARGB8888 and only its importable modifier.
+		let importable = [format(Fourcc::Argb8888, BLOCK_LINEAR)];
+		assert_eq!(
+			pyrowave_capture_formats(&renderable, Some(&importable), false),
+			[(Fourcc::Argb8888, vec![Modifier::from(BLOCK_LINEAR)])]
 		);
 	}
 
