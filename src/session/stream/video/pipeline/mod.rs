@@ -116,26 +116,11 @@ fn is_device_lost(e: &PixelForgeError) -> bool {
 
 pub(crate) struct VideoPipeline {}
 
-/// A single frame's latency breakdown for periodic summary reporting.
-struct LatencySample {
-	channel_wait: std::time::Duration,
-	import: std::time::Duration,
-	convert: std::time::Duration,
-	submit: std::time::Duration,
-	consumer_queue: std::time::Duration,
-	encode_wait: std::time::Duration,
-	packetize: std::time::Duration,
-	send: std::time::Duration,
-	total: std::time::Duration,
-	encoded_bytes: usize,
-	is_key_frame: bool,
-}
-
 /// Log a summary of latency statistics over a batch of samples.
 ///
 /// `elapsed` is the wall-clock time the batch was collected over, used to
 /// derive throughput (fps, bitrate).
-fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) {
+fn log_latency_summary(samples: &[FrameStats], elapsed: std::time::Duration) {
 	let n = samples.len();
 	if n == 0 {
 		return;
@@ -311,7 +296,7 @@ async fn run_packet_consumer(
 	let mut frame_number = 0u32;
 	let mut sequence_number = 0u32;
 	let mut reset_epoch = 0u32;
-	let mut latency_samples: Vec<LatencySample> = Vec::with_capacity(512);
+	let mut latency_samples: Vec<FrameStats> = Vec::with_capacity(512);
 	let mut last_summary_time = std::time::Instant::now();
 	let frame_interval_us = 1_000_000 / ctx.fps as u128;
 	let mut epoch = None;
@@ -457,22 +442,32 @@ async fn run_packet_consumer(
 			Err(_) => break,
 		};
 
-		let packetize_dur = t_packetized - t_start;
-		let send_dur = t_sent - t_packetized;
-		let total = t_sent.duration_since(frame_context.created_at);
+		let stats = FrameStats {
+			channel_wait: frame_context.channel_wait,
+			import: frame_context.import,
+			convert: frame_context.convert,
+			submit: frame_context.submit,
+			consumer_queue: consumer_queue_dur,
+			encode_wait: encode_wait_dur,
+			packetize: t_packetized - t_start,
+			send: t_sent - t_packetized,
+			total: t_sent.duration_since(frame_context.created_at),
+			encoded_bytes,
+			is_key_frame,
+		};
 
 		// Warn on spike frames (total > frame interval) so they stand out.
-		if config.log_frame_spikes && total.as_micros() > frame_interval_us {
+		if config.log_frame_spikes && stats.total.as_micros() > frame_interval_us {
 			tracing::warn!(
-				total_us = total.as_micros() as u64,
-				channel_us = frame_context.channel_wait.as_micros() as u64,
-				import_us = frame_context.import.as_micros() as u64,
-				convert_us = frame_context.convert.as_micros() as u64,
-				submit_us = frame_context.submit.as_micros() as u64,
-				consumer_queue_us = consumer_queue_dur.as_micros() as u64,
-				encode_wait_us = encode_wait_dur.as_micros() as u64,
-				packetize_us = packetize_dur.as_micros() as u64,
-				send_us = send_dur.as_micros() as u64,
+				total_us = stats.total.as_micros() as u64,
+				channel_us = stats.channel_wait.as_micros() as u64,
+				import_us = stats.import.as_micros() as u64,
+				convert_us = stats.convert.as_micros() as u64,
+				submit_us = stats.submit.as_micros() as u64,
+				consumer_queue_us = stats.consumer_queue.as_micros() as u64,
+				encode_wait_us = stats.encode_wait.as_micros() as u64,
+				packetize_us = stats.packetize.as_micros() as u64,
+				send_us = stats.send.as_micros() as u64,
 				encoded_bytes,
 				is_key_frame,
 				sequence = frame_context.sequence,
@@ -481,33 +476,8 @@ async fn run_packet_consumer(
 			);
 		}
 
-		latency_samples.push(LatencySample {
-			channel_wait: frame_context.channel_wait,
-			import: frame_context.import,
-			convert: frame_context.convert,
-			submit: frame_context.submit,
-			consumer_queue: consumer_queue_dur,
-			encode_wait: encode_wait_dur,
-			packetize: packetize_dur,
-			send: send_dur,
-			total,
-			encoded_bytes,
-			is_key_frame,
-		});
-
-		let _ = stats_tx.send(FrameStats {
-			channel_wait: frame_context.channel_wait,
-			import: frame_context.import,
-			convert: frame_context.convert,
-			submit: frame_context.submit,
-			consumer_queue: consumer_queue_dur,
-			encode_wait: encode_wait_dur,
-			packetize: packetize_dur,
-			send: send_dur,
-			total,
-			encoded_bytes,
-			is_key_frame,
-		});
+		let _ = stats_tx.send(stats.clone());
+		latency_samples.push(stats);
 
 		// Periodic summary every 5 seconds.
 		if last_summary_time.elapsed() >= std::time::Duration::from_secs(5) && !latency_samples.is_empty() {
