@@ -16,6 +16,7 @@ mod pacer;
 mod packetizer;
 mod pipeline;
 mod pyrowave_framing;
+pub(crate) use pipeline::importable_formats;
 mod shard_batch;
 use gso_socket::UdpGsoSocket;
 use pacer::Pacer;

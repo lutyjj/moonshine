@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::session::SessionContext;
 use crate::session::manager::SessionShutdownReason;
+use crate::session::stream::video::importable_formats;
 
 use self::input::CompositorInput;
 
@@ -239,7 +240,27 @@ impl Compositor {
 			tracing::error!("Failed to find render node: {e}");
 		})?;
 
-		let ferriscope_config = build_ferriscope_config(&config, &context, render_node);
+		// The pool may only use layouts the encoder can import. This asks the
+		// render node's GPU, assuming the encoder runs on it, as it does on a
+		// host with one GPU. Without an answer the compositor picks among
+		// everything it can render into; with one that shares no layout with
+		// what it renders, it fails to start rather than produce frames the
+		// encoder rejects.
+		let frame_formats = match importable_formats(&render_node, context.width, context.height) {
+			Ok(formats) if !formats.is_empty() => Some(formats),
+			Ok(_) => {
+				tracing::warn!("The GPU imports no frame format as a DMA-BUF; leaving the choice to the compositor");
+				None
+			},
+			Err(e) => {
+				tracing::warn!("Could not query the frame formats the GPU imports: {e}");
+				None
+			},
+		};
+		let ferriscope_config = ferriscope::CompositorConfig {
+			frame_formats,
+			..build_ferriscope_config(&config, &context, render_node)
+		};
 		tracing::info!(
 			steam = ferriscope_config.steam,
 			width = ferriscope_config.width,

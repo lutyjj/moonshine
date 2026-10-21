@@ -3,6 +3,7 @@
 //! Encoders submit frame output to a shared packetizer and network sender.
 
 mod dmabuf;
+pub(crate) use dmabuf::importable_formats;
 mod fence;
 mod hdr_sei;
 mod pyrowave;
