@@ -14,6 +14,7 @@ See the [Configuration](../README.md#configuration) section of the README for th
 - [Run Flatpak Bottles inside Moonshine's compositor](#run-flatpak-bottles-inside-moonshines-compositor)
 - [Run a desktop environment for a full remote desktop](#run-a-desktop-environment-for-a-full-remote-desktop)
 - [Debug a failing application](#debug-a-failing-application)
+- [See where a frame's latency goes](#see-where-a-frames-latency-goes)
 
 ## Close a desktop Steam before streaming Steam
 
@@ -225,3 +226,39 @@ You can also add `-e` to jump to the end of the log and `-f` to follow it live w
 By default Moonshine launches applications with `StandardOutput=null` and `StandardError=null`, so an application that fails to start produces no diagnostic output at all. Redirecting to the journal makes its stderr (where most crash output and backtraces land) visible, which is usually the fastest way to find out why the session failed to launch.
 
 These fields are also available on `[[application_scanner]]` configs for games launched through Steam/Lutris/Heroic. Instead of the journal you can also redirect to a file, e.g. `stdout = "file:/path/to/log.txt"`; any systemd `StandardOutput`/`StandardError` value (`journal`, `file:/path`, `append:/path`, `inherit`, ...) is accepted.
+
+## See where a frame's latency goes
+
+### How to
+
+Log the latency of frames slower than the frame interval, broken down by pipeline stage:
+
+```toml
+[stream.video]
+log_frame_spikes = true
+```
+
+Or log every frame, with the frame number and RTP timestamp the client receives it with:
+
+```sh
+MOONSHINE_LOG=moonshine=info,moonshine::frame_latency=trace moonshine ~/.config/moonshine/config.toml
+```
+
+```text
+TRACE moonshine::frame_latency: Frame latency frame_number=7 rtp_timestamp=3782 since_epoch_us=42025 total_us=1831 channel_us=92 import_us=2 convert_us=602 submit_us=41 consumer_queue_us=19 encode_wait_us=1070 packetize_us=21 send_us=0 encoded_bytes=37968 is_key_frame=false sequence=6
+```
+
+For the packaged service, set the filter with `sudo systemctl edit moonshine@$USER`:
+
+```ini
+[Service]
+Environment=MOONSHINE_LOG=moonshine=info,moonshine::frame_latency=trace
+```
+
+Then restart it with `sudo systemctl restart moonshine@$USER`.
+
+On NixOS, set `services.moonshine.logFilter` to the same value.
+
+### Details
+
+`since_epoch_us` is the frame's capture time, counted from the capture of the session's first frame, the instant the RTP timestamps count from. With a client that records the RTP timestamp of each frame it receives, the two logs can be joined frame by frame to follow a stutter from the host to the client. Join on `rtp_timestamp`: the frame number restarts when a client resumes the session. `sequence` is the compositor's frame number, absent for re-encoded key frames.
