@@ -14,6 +14,7 @@
   vulkan-loader,
   wayland,
   libglvnd,
+  shaderc,
 }:
 
 let
@@ -165,6 +166,10 @@ rustPlatform.buildRustPackage {
     libopus
     vulkan-loader
     wayland
+    # smithay's Vulkan renderer compiles its shaders with shaderc-sys, which
+    # finds this through pkg-config; without it, it builds its vendored
+    # shaderc from source, which needs git in the sandbox.
+    shaderc
   ];
 
   # The tests exercise the compositor/encoder paths and expect devices
