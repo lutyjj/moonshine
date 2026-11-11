@@ -26,14 +26,15 @@ moonshine-bench [OPTIONS] <COMMAND>
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--matrix` | off | Run the built-in 4K, 1440p, and 1080p matrix across 60/120/360 FPS and `hevc`, `h264`, and `av1` |
+| `--matrix` | off | Run the built-in 4K, 1440p, and 1080p matrix across 60/120/360 FPS and `hevc`, `h264`, `av1`, and `pyrowave` |
 | `--resolution <WxH>` | `1920x1080` | Stream resolution |
 | `--fps <N>` | `60` | Target frame rate |
 | `--bitrate <N>` | `20000000` | Target bitrate in bits per second |
-| `--codec <codec>` | `h264` | Video codec: `h264`, `hevc`, or `av1` |
+| `--codec <codec>` | `h264` | Video codec: `h264`, `hevc`, `av1`, or `pyrowave` |
 | `--duration <N>` | `0` | Seconds to run before stopping (`0` = run until Ctrl+C) |
 | `--warmup <N>` | `4` | Seconds to discard before recording stats |
 | `--hdr` | off | Enable HDR mode |
+| `--yuv444` | off | Encode with full chroma resolution (4:4:4) |
 | `--verbose` | off | Print per-frame stats instead of periodic summary |
 
 ### Examples
@@ -50,7 +51,7 @@ Compare AV1 encoding at 4K:
 moonshine-bench --resolution 3840x2160 --codec av1 --bitrate 50000000 --duration 60 /usr/bin/vkcube
 ```
 
-Run the full 4K/1440p/1080p x 60/120/360 FPS x HEVC/H.264/AV1 matrix:
+Run the full 4K/1440p/1080p x 60/120/360 FPS x HEVC/H.264/AV1/PyroWave matrix:
 
 ```bash
 cargo run --release -p moonshine-tools --bin moonshine-bench -- --matrix --duration 30 --warmup 4 /usr/bin/vkcube
