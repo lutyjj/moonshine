@@ -11,7 +11,7 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 
 - **Isolated streaming sessions**: Each stream runs in its own compositor, completely separate from your desktop environment. Your host PC can still be used for other things while you stream.
 - **No monitor required**: Works on headless servers — no HDMI dummy plug needed.
-- **Hardware video encoding**: H.264, H.265, and AV1 encoding using the GPU.
+- **Hardware video encoding**: H.264, H.265, AV1, and PyroWave encoding using the GPU. PyroWave needs a Moonlight client that speaks its record framing, such as [Nonary's fork](https://github.com/Nonary/moonlight-qt), and a wired link with room for its bitrate, hundreds of megabits a second or more. SDR PyroWave is always BT.709, whatever matrix the client asks for, and its frames carry no colour tag, so the client must decode SDR as BT.709.
 - **HDR support**: True 10-bit HDR streaming for supported games.
 - **Full input support**: Mouse, keyboard, touchscreen, pen/stylus, and gamepad (including motion, touchpad, and haptics).
 - **Audio streaming**: Stereo and surround sound (5.1/7.1) with low-latency Opus encoding.
@@ -20,7 +20,7 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 
 1. **Linux only**. Available as `.deb`, `.rpm`, Nix, AUR, and an install script for SteamOS. Tested on Arch Linux, but reported to work on other distributions too.
 1. **systemd**. Required for launching and managing application processes. Almost all modern Linux distributions include it by default.
-1. **A GPU with Vulkan video encoding**. NVIDIA RTX, AMD RDNA2+, or Intel Arc.
+1. **A GPU with Vulkan video encoding**. NVIDIA RTX, AMD RDNA2+, or Intel Arc. PyroWave only needs Vulkan compute.
 1. **Moonlight v6.0.0 or higher**. Compatibility with older versions or unofficial ports is not guaranteed.
 
 ## Installation
@@ -131,6 +131,7 @@ sudo pacman -S --asdeps \
    clang \
    cmake \
    jq \
+   patch \
    libc++ \
    rust
 

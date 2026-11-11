@@ -14,11 +14,13 @@ use crate::session::stream::{StartSignal, StartWaiter};
 mod gso_socket;
 mod packetizer;
 mod pipeline;
+mod pyrowave_framing;
 mod shard_batch;
 
 pub use crate::session::compositor::frame::FrameColorSpace;
 use gso_socket::UdpGsoSocket;
 pub(crate) use pipeline::KcmpProbe;
+pub(crate) use pipeline::probe_pyrowave;
 use pipeline::{MAX_FRAMES_IN_FLIGHT, PacketBatch, VideoPipeline};
 
 /// Configuration for the video stream.
@@ -29,6 +31,12 @@ pub struct VideoStreamConfig {
 	pub port: u16,
 
 	/// What percentage of data packets should be parity packets.
+	///
+	/// A PyroWave stream protects only the packets a frame can't be decoded
+	/// without. Losing any other packet costs that frame some detail. They
+	/// are protected only when the packet's payload, its size less 16 bytes,
+	/// is a multiple of 4 bytes, and fit one Reed-Solomon block with their
+	/// parity; otherwise nothing is.
 	pub fec_percentage: u8,
 
 	/// Whether to enable video stream encryption (AES-128-GCM).
@@ -325,6 +333,8 @@ pub enum VideoFormat {
 	H264,
 	Hevc,
 	Av1,
+	/// Intra-only wavelet codec: every frame is a key frame.
+	PyroWave,
 }
 
 impl TryFrom<u32> for VideoFormat {
@@ -335,6 +345,7 @@ impl TryFrom<u32> for VideoFormat {
 			0 => Ok(Self::H264),
 			1 => Ok(Self::Hevc),
 			2 => Ok(Self::Av1),
+			3 => Ok(Self::PyroWave),
 			_ => Err(()),
 		}
 	}

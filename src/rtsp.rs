@@ -11,6 +11,7 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
 use crate::ShutdownReason;
+use crate::healthcheck;
 use crate::session::manager::SessionManager;
 use crate::session::stream::audio::ALL_AUDIO_CONFIGS;
 use crate::session::stream::audio::AudioChannels;
@@ -76,16 +77,25 @@ pub struct RtspServer {
 	video_config: VideoStreamConfig,
 	audio_config: AudioStreamConfig,
 	control_config: ControlStreamConfig,
+	/// `ServerCodecModeSupport` mask from the startup probe.
+	supported_codecs: u32,
 	session_manager: SessionManager,
 }
 
 impl RtspServer {
+	/// Whether the startup probe found an encoder for any profile of `format`.
+	fn supports(&self, format: VideoFormat) -> bool {
+		self.supported_codecs & healthcheck::profiles_of(format) != 0
+	}
+
+	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		address: String,
 		rtsp_port: u16,
 		video_config: VideoStreamConfig,
 		audio_config: AudioStreamConfig,
 		control_config: ControlStreamConfig,
+		supported_codecs: u32,
 		session_manager: SessionManager,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Self {
@@ -95,6 +105,7 @@ impl RtspServer {
 			video_config: video_config.clone(),
 			audio_config: audio_config.clone(),
 			control_config: control_config.clone(),
+			supported_codecs,
 			session_manager,
 		};
 
@@ -177,6 +188,11 @@ impl RtspServer {
 		result.push_str("sprop-parameter-sets=AAAAAU\n");
 		result.push_str("a=x-nv-video[0].refPicInvalidation:1\n");
 		result.push_str("a=rtpmap:98 AV1/90000\n");
+		if self.supports(VideoFormat::PyroWave) {
+			// Capability marker only: payload type 99 is never sent.
+			result.push_str("a=rtpmap:99 PYROWAVE/90000\n");
+			result.push_str(&format!("a=x-ss-pyrowave.bitstream:{}\n", pyrowave::BITSTREAM_ID));
+		}
 		result.push_str("a=fmtp:96 packetization-mode=1\n");
 
 		// Emit surround-params for each Opus configuration.
@@ -396,6 +412,25 @@ impl RtspServer {
 			},
 		};
 
+		// A host can run with PyroWave alone, so no codec is a given.
+		if !self.supports(video_format) {
+			tracing::warn!("Client requested {video_format:?}, which this host cannot encode.");
+			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+		}
+
+		// Either attribute announces record framing. Older clients expect
+		// length-prefixed framing, which is not produced.
+		if video_format == VideoFormat::PyroWave {
+			const PYROWAVE_FEATURE_RECORD_FRAMING: u32 = 0x1;
+			let features: u32 =
+				get_optional_sdp_attribute(&sdp_session, "x-ss-video[0].pyrowaveFeatures").unwrap_or_default();
+			let adaptive_fec: Option<u32> =
+				get_optional_sdp_attribute(&sdp_session, "x-ss-video[0].pyrowaveAdaptiveFec");
+			if features & PYROWAVE_FEATURE_RECORD_FRAMING == 0 && adaptive_fec.is_none() {
+				tracing::warn!("Client requested PyroWave without record framing, which is not supported.");
+				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+			}
+		}
 		let dynamic_range: u32 =
 			get_optional_sdp_attribute(&sdp_session, "x-nv-video[0].dynamicRangeMode").unwrap_or_default();
 		let dynamic_range = VideoDynamicRange::try_from(dynamic_range).unwrap_or_default();
@@ -403,6 +438,13 @@ impl RtspServer {
 		let chroma_sampling_type: u32 =
 			get_optional_sdp_attribute(&sdp_session, "x-ss-video[0].chromaSamplingType").unwrap_or_default();
 		let chroma_sampling_type = VideoChromaSampling::try_from(chroma_sampling_type).unwrap_or_default();
+
+		if video_format == VideoFormat::PyroWave
+			&& self.supported_codecs & healthcheck::pyrowave_profile(chroma_sampling_type, dynamic_range) == 0
+		{
+			tracing::warn!("Client requested an unavailable PyroWave profile.");
+			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+		}
 
 		let max_reference_frames: u32 =
 			get_optional_sdp_attribute(&sdp_session, "x-nv-video[0].maxNumReferenceFrames").unwrap_or(1);
@@ -670,6 +712,110 @@ fn get_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &s
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn test_server() -> RtspServer {
+		let shutdown = ShutdownManager::new();
+		let manager = SessionManager::new(
+			Default::default(),
+			Default::default(),
+			Default::default(),
+			Default::default(),
+			"127.0.0.1".into(),
+			10,
+			false,
+			shutdown,
+		)
+		.unwrap();
+		RtspServer {
+			address: "127.0.0.1".into(),
+			rtsp_port: 0,
+			video_config: Default::default(),
+			audio_config: Default::default(),
+			control_config: Default::default(),
+			supported_codecs: 0,
+			session_manager: manager,
+		}
+	}
+
+	#[test]
+	fn description_advertises_pyrowave_only_when_available() {
+		let mut server = test_server();
+		for mask in [0, 0x100, 0x10000, 0x800000, 0x810101] {
+			server.supported_codecs = mask;
+			let description = server.description();
+			assert!(description.contains("sprop-parameter-sets=AAAAAU"));
+			assert!(description.contains("a=rtpmap:98 AV1/90000"));
+			let pyrowave = mask & 0x800000 != 0;
+			assert_eq!(description.contains("a=rtpmap:99 PYROWAVE/90000"), pyrowave);
+			assert_eq!(description.contains("a=x-ss-pyrowave.bitstream:"), pyrowave);
+		}
+	}
+	#[tokio::test]
+	async fn announce_rejects_what_the_host_cannot_encode() {
+		let mut server = test_server();
+		// A client asks for record framing with either attribute.
+		const FEATURES: Option<&str> = Some("x-ss-video[0].pyrowaveFeatures:1");
+		const ADAPTIVE_FEC: Option<&str> = Some("x-ss-video[0].pyrowaveAdaptiveFec:1");
+		for (format, available, framing, expected) in [
+			(3, false, FEATURES, rtsp_types::StatusCode::BadRequest),
+			(3, true, None, rtsp_types::StatusCode::BadRequest),
+			// Valid negotiation reaches the session manager, which has no
+			// launched session.
+			(3, true, FEATURES, rtsp_types::StatusCode::InternalServerError),
+			(3, true, ADAPTIVE_FEC, rtsp_types::StatusCode::InternalServerError),
+			(0, true, None, rtsp_types::StatusCode::InternalServerError),
+			(1, true, None, rtsp_types::StatusCode::InternalServerError),
+			(2, true, None, rtsp_types::StatusCode::InternalServerError),
+			(0, false, None, rtsp_types::StatusCode::BadRequest),
+			(1, false, None, rtsp_types::StatusCode::BadRequest),
+			(2, false, None, rtsp_types::StatusCode::BadRequest),
+		] {
+			// Every PyroWave profile and the base H.264, HEVC and AV1 ones.
+			server.supported_codecs = if available { 0x07810101 } else { 0 };
+			let mut sdp = format!(
+				"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=video\r\nt=0 0\r\n\
+				a=x-nv-video[0].clientViewportWd:1280\r\n\
+				a=x-nv-video[0].clientViewportHt:720\r\n\
+				a=x-nv-video[0].maxFPS:60\r\n\
+				a=x-nv-video[0].packetSize:1392\r\n\
+				a=x-ml-video.configuredBitrateKbps:100000\r\n\
+				a=x-nv-vqos[0].fec.minRequiredFecPackets:2\r\n\
+				a=x-nv-vqos[0].qosTrafficType:0\r\n\
+				a=x-nv-vqos[0].bitStreamFormat:{format}\r\n\
+				a=x-nv-aqos.packetDuration:5\r\n\
+				a=x-nv-aqos.qosTrafficType:0\r\n"
+			);
+			if let Some(framing) = framing {
+				sdp.push_str(&format!("a={framing}\r\n"));
+			}
+			for (range, chroma, profile) in [
+				(0, 0, 0x00800000),
+				(0, 1, 0x01000000),
+				(1, 0, 0x02000000),
+				(1, 1, 0x04000000),
+			] {
+				let body = format!(
+					"{sdp}a=x-nv-video[0].dynamicRangeMode:{range}\r\na=x-ss-video[0].chromaSamplingType:{chroma}\r\n"
+				);
+				let request = rtsp_types::Request::builder(rtsp_types::Method::Announce, rtsp_types::Version::V1_0)
+					.build(body.into_bytes());
+				let response = server.handle_announce_request(&request, 1).await;
+				assert_eq!(
+					response.status(),
+					expected,
+					"format={format}, available={available}, framing={framing:?}, range={range}, chroma={chroma}"
+				);
+				if format == 3 && available {
+					server.supported_codecs &= !profile;
+					assert_eq!(
+						server.handle_announce_request(&request, 1).await.status(),
+						rtsp_types::StatusCode::BadRequest
+					);
+					server.supported_codecs |= profile;
+				}
+			}
+		}
+	}
 
 	#[test]
 	fn replace_bytes_matches_str_replace() {

@@ -1,11 +1,15 @@
 //! Video encoding and streaming pipeline.
 //!
-//! This module handles video encoding with pixelforge
+//! This module handles video encoding with pixelforge or PyroWave
 //! and packetization for network transmission.
 
 mod dmabuf;
 mod fence;
 mod hdr_sei;
+mod pyrowave;
+
+use pyrowave::PyroWaveEncoder;
+pub(crate) use pyrowave::probe as probe_pyrowave;
 
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
@@ -14,6 +18,7 @@ use std::sync::atomic::Ordering;
 
 use ash::vk;
 use async_shutdown::ShutdownManager;
+use bytes::Bytes;
 use smithay::backend::allocator::Buffer;
 use tokio::sync::{broadcast, mpsc, watch};
 
@@ -236,7 +241,7 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 }
 
 /// Per-submitted-frame context handed to the packet consumer thread, in
-/// submission order. It travels alongside that frame's [`EncodeFuture`] in a
+/// submission order. It travels alongside that frame's [`PendingFrame`] in a
 /// single [`ConsumerMessage::Frame`], so the packet is paired with its context by
 /// construction — there is no separate packet channel to keep in lockstep.
 struct FrameContext {
@@ -262,13 +267,48 @@ struct FrameContext {
 	content: Option<FrameColorSpace>,
 }
 
+/// A submitted frame's encoder output, when it comes.
+enum PendingFrame {
+	/// Resolves with the packet once the GPU has encoded it.
+	Coded(EncodeFuture),
+	/// Already encoded: PyroWave encodes on the encoding thread.
+	Ready(EncodedFrame),
+}
+
+impl FrameContext {
+	/// Context for a frame submitted without a fresh capture.
+	fn immediate(now: std::time::Instant) -> Self {
+		Self {
+			created_at: now,
+			channel_wait: std::time::Duration::ZERO,
+			import: std::time::Duration::ZERO,
+			convert: std::time::Duration::ZERO,
+			submit: std::time::Duration::ZERO,
+			submitted_at: now,
+			inject_hdr: false,
+			hdr_metadata: None,
+			sequence: None,
+			content: None,
+		}
+	}
+}
+
+/// One frame's encoder output, ready to packetize.
+#[derive(Clone)]
+struct EncodedFrame {
+	data: Bytes,
+	is_key_frame: bool,
+	/// Where PyroWave's records start, for packing them into packets.
+	record_layout: Option<Arc<super::pyrowave_framing::RecordLayout>>,
+}
+
 /// Message from the encoding thread to the packet consumer thread, in
 /// submission order.
 enum ConsumerMessage {
-	/// A submitted frame's context together with the [`EncodeFuture`] that
-	/// resolves with its encoded packet. Awaiting the future yields the packet
-	/// for exactly this frame, so context and packet are paired by construction.
-	Frame(FrameContext, EncodeFuture),
+	/// A submitted frame's context together with its [`PendingFrame`]. Awaiting
+	/// that yields the packet for exactly this frame, so context and packet are
+	/// paired by construction.
+	Frame(FrameContext, PendingFrame),
 	/// Reset the RTP/frame counters (client reconnect/resume), so subsequent
 	/// packets restart from frame 1. Ordered with `Frame` messages so it takes
 	/// effect before any frame submitted after the reset. Carries the reset's
@@ -382,44 +422,56 @@ async fn run_packet_consumer(
 
 		let t_wait_started = std::time::Instant::now();
 		let consumer_queue_dur = t_wait_started.saturating_duration_since(frame_context.submitted_at);
-		let mut packet = match future.await {
-			Ok(packet) => packet,
-			Err(e) => {
-				// A frame whose bitstream overflowed its destination buffer was
-				// truncated and is not sent. Request an IDR so the next frame is a
-				// keyframe, keeping the client's reference chain decodable.
-				if let PixelForgeError::BufferOverflow { written, capacity } = &e {
-					tracing::warn!(
-						written,
-						capacity,
-						"Encoded frame overflowed bitstream buffer; requesting IDR"
-					);
-					let _ = idr_tx.send(());
-				} else {
-					tracing::warn!("Failed to read back encoded frame: {e}");
+		let (frame, gpu_encode, bitstream_ready) = match future {
+			PendingFrame::Coded(future) => {
+				let mut packet = match future.await {
+					Ok(packet) => packet,
+					Err(e) => {
+						// A frame whose bitstream overflowed its destination buffer was
+						// truncated and is not sent. Request an IDR so the next frame is a
+						// keyframe, keeping the client's reference chain decodable.
+						if let PixelForgeError::BufferOverflow { written, capacity } = &e {
+							tracing::warn!(
+								written,
+								capacity,
+								"Encoded frame overflowed bitstream buffer; requesting IDR"
+							);
+							let _ = idr_tx.send(());
+						} else {
+							tracing::warn!("Failed to read back encoded frame: {e}");
+						}
+						continue;
+					},
+				};
+
+				// Inject HDR metadata into the bitstream on key frames, but only when
+				// encoding as BT.2020+PQ. SDR frames encoded as BT.709 carry no HDR SEI.
+				if packet.is_key_frame() && frame_context.inject_hdr {
+					// Fall back to default HDR10 metadata when the content provides none
+					// (e.g. scRGB swapchains carry no mastering metadata), staying
+					// consistent with the control-stream HDR metadata.
+					let m = frame_context.hdr_metadata.unwrap_or_else(HdrMetadata::fallback);
+					packet.data = hdr_sei::inject_hdr_metadata(&packet.data, &m, ctx.video_format);
 				}
-				continue;
+
+				// GPU hardware time and submit-to-bitstream-ready wall time come from
+				// pixelforge. Neither is interchangeable with the async future's wait.
+				let gpu_encode = packet.stats.gpu_time_ns.map(std::time::Duration::from_nanos);
+				let bitstream_ready = Some(std::time::Duration::from_nanos(packet.stats.wall_latency_ns));
+				let frame = EncodedFrame {
+					is_key_frame: packet.is_key_frame(),
+					data: Bytes::from(packet.data),
+					record_layout: None,
+				};
+				(frame, gpu_encode, bitstream_ready)
 			},
+			PendingFrame::Ready(frame) => (frame, None, None),
 		};
 		let t_packet_ready = std::time::Instant::now();
 		let encode_wait_dur = t_packet_ready.saturating_duration_since(frame_context.submitted_at);
 
-		// Inject HDR metadata into the bitstream on key frames, but only when
-		// encoding as BT.2020+PQ. SDR frames encoded as BT.709 carry no HDR SEI.
-		if packet.is_key_frame() && frame_context.inject_hdr {
-			// Fall back to default HDR10 metadata when the content provides none
-			// (e.g. scRGB swapchains carry no mastering metadata), staying
-			// consistent with the control-stream HDR metadata.
-			let m = frame_context.hdr_metadata.unwrap_or_else(HdrMetadata::fallback);
-			packet.data = hdr_sei::inject_hdr_metadata(&packet.data, &m, ctx.video_format);
-		}
-
-		// GPU hardware time and submit-to-bitstream-ready wall time come from
-		// pixelforge. Neither is interchangeable with the async future's wait.
-		let gpu_encode = packet.stats.gpu_time_ns.map(std::time::Duration::from_nanos);
-		let bitstream_ready = Some(std::time::Duration::from_nanos(packet.stats.wall_latency_ns));
-		let encoded_bytes = packet.data.len();
-		let is_key_frame = packet.is_key_frame();
+		let encoded_bytes = frame.data.len();
+		let is_key_frame = frame.is_key_frame;
 
 		// Clients take the RTP timestamp (90 kHz) as the frame's presentation time.
 		let epoch = *epoch.get_or_insert(frame_context.created_at);
@@ -439,8 +491,9 @@ async fn run_packet_consumer(
 		let latency_100us = (processing_latency.as_micros() / 100).min(u16::MAX as u128) as u16;
 
 		let shards = match packetizer.packetize(
-			&packet.data,
+			&frame.data,
 			is_key_frame,
+			frame.record_layout.as_deref(),
 			ctx.packet_size,
 			ctx.minimum_fec_packets,
 			config.fec_percentage,
@@ -646,36 +699,57 @@ impl VideoPipelineInner {
 			return;
 		}
 
-		// Create the encoder.
-		let (context, encoder) = match self.create_encoder() {
-			Ok(result) => result,
-			Err(e) => {
-				tracing::error!("Failed to create video encoder: {e}");
-				return;
-			},
-		};
-
 		// Stats readers learn the stream's parameters before its first frame, and that it ended
 		// once its last frame is sent, however the loop exits. The session doesn't finish stopping
 		// until this thread is done, so the next stream starts after this one has stopped.
-		stats_tx.started(StreamInfo::from(&self.context));
-		let _stopped = StreamStoppedOnDrop(stats_tx.clone());
+		let started = || {
+			stats_tx.started(StreamInfo::from(&self.context));
+			StreamStoppedOnDrop(stats_tx.clone())
+		};
 
-		// Start the capture and encoding loop.
-		if let Err(e) = self.run_encoding_loop(
-			runtime,
-			frames,
-			context,
-			encoder,
-			packet_tx,
-			idr_tx,
-			idr_frame_request_rx,
-			invalidate_request_rx,
-			reset_request_rx,
-			stop_session_manager,
-			hdr_metadata_tx,
-			stats_tx,
-		) {
+		// Create the encoder, then start the capture and encoding loop.
+		let result = if self.context.video_format == VideoFormat::PyroWave {
+			match PyroWaveEncoder::new(&self.context) {
+				Ok(encoder) => {
+					let _stopped = started();
+					self.run_pyrowave_loop(
+						runtime,
+						frames,
+						encoder,
+						packet_tx,
+						idr_tx,
+						idr_frame_request_rx,
+						reset_request_rx,
+						stop_session_manager,
+						hdr_metadata_tx,
+						stats_tx,
+					)
+				},
+				Err(e) => Err(format!("Failed to create PyroWave encoder: {e}")),
+			}
+		} else {
+			match self.create_encoder() {
+				Ok((context, encoder)) => {
+					let _stopped = started();
+					self.run_encoding_loop(
+						runtime,
+						frames,
+						context,
+						encoder,
+						packet_tx,
+						idr_tx,
+						idr_frame_request_rx,
+						invalidate_request_rx,
+						reset_request_rx,
+						stop_session_manager,
+						hdr_metadata_tx,
+						stats_tx,
+					)
+				},
+				Err(e) => Err(format!("Failed to create video encoder: {e}")),
+			}
+		};
+		if let Err(e) = result {
 			tracing::error!("Video encoding loop failed: {e}");
 		}
 
@@ -695,6 +769,7 @@ impl VideoPipelineInner {
 			VideoFormat::H264 => Codec::H264,
 			VideoFormat::Hevc => Codec::H265,
 			VideoFormat::Av1 => Codec::AV1,
+			VideoFormat::PyroWave => return Err("PyroWave is not encoded by pixelforge".to_string()),
 		};
 
 		// Convert pixel format.
@@ -774,48 +849,12 @@ impl VideoPipelineInner {
 			return Err("The compositor was not launched".to_string());
 		};
 
-		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
-		packetizer.warm_up(self.config.fec_percentage, ctx.minimum_fec_packets);
-
-		// The encoder is asynchronous: each `submit()` returns a future that
-		// resolves with that frame's packet once the GPU finishes. We hand each
-		// future, together with its per-frame context, to a dedicated consumer
-		// thread (in submission order via `frame_ctx_tx`) which awaits it and
-		// packetizes/sends — so packets go out as soon as the GPU finishes,
-		// independent of this loop's cadence.
-		//
-		// `in_flight` counts frames submitted but not yet taken by the network
-		// sender. The encoding thread reads it to decide when to drop new captures
-		// (see `MAX_FRAMES_IN_FLIGHT`); a frame's slot is released when the sender
-		// takes its batch, or when the consumer drops it. The channel
-		// is sized just above that gate so it never actually blocks the producer —
-		// admission is governed by the drop gate, not by the channel filling.
-		let in_flight = Arc::new(AtomicUsize::new(0));
-		let (frame_ctx_tx, frame_ctx_rx) = mpsc::channel::<ConsumerMessage>(MAX_FRAMES_IN_FLIGHT + 2);
-		// Lets the drop warning tell a backed-up send queue (network) from frames
-		// still encoding (GPU). Weak, so it doesn't keep the channel open.
-		let send_queue = packet_tx.downgrade();
-		let consumer = {
-			let ctx = self.context.clone();
-			let config = self.config.clone();
-			let in_flight = in_flight.clone();
-			// The packetize/send half is pure async work (await the encode future,
-			// packetize, send) with no blocking GPU calls, so it runs as a task on
-			// moonshine's main runtime — a green thread multiplexed with the rest of
-			// the session — rather than its own OS thread. Only this capture/encode
-			// loop needs a real thread, as it blocks on the frame channel and the
-			// Vulkan submit path.
-			runtime.spawn(run_packet_consumer(
-				frame_ctx_rx,
-				packet_tx,
-				stats_tx,
-				in_flight,
-				idr_tx.clone(),
-				packetizer,
-				ctx,
-				config,
-			))
-		};
+		let PacketConsumer {
+			frame_ctx_tx,
+			in_flight,
+			send_queue,
+			task: consumer,
+		} = self.spawn_packet_consumer(&runtime, packet_tx, stats_tx, idr_tx.clone());
 
 		// Rate-limits the drop-to-catch-up warning.
 		let mut last_drop_warn: Option<std::time::Instant> = None;
@@ -954,7 +993,8 @@ impl VideoPipelineInner {
 								// it or the consumer drops it.
 								in_flight.fetch_add(1, Ordering::Relaxed);
 								submitted_count += 1;
-								let _ = frame_ctx_tx.blocking_send(ConsumerMessage::Frame(frame_context, future));
+								let _ = frame_ctx_tx
+									.blocking_send(ConsumerMessage::Frame(frame_context, PendingFrame::Coded(future)));
 							},
 							Err(PixelForgeError::DeviceLost) => {
 								return Err("Failed to re-encode frame for IDR request: the GPU was lost".to_string());
@@ -983,24 +1023,7 @@ impl VideoPipelineInner {
 				// the encoder's reference state). The IDR re-encode path is never
 				// gated — the client needs that keyframe.
 				if in_flight.load(Ordering::Relaxed) >= MAX_FRAMES_IN_FLIGHT {
-					if last_drop_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
-						// Batches waiting for the sender hold slots only until it takes them,
-						// so any queued batch means the socket isn't draining.
-						let queued = send_queue.upgrade().map_or(0, |tx| tx.max_capacity() - tx.capacity());
-						if queued > 0 {
-							tracing::warn!(
-								queued,
-								"Video send backpressure: the network isn't keeping up; dropping \
-								 captured frames before encode to stay realtime."
-							);
-						} else {
-							tracing::warn!(
-								"Video encode backpressure: the encoder isn't keeping up; dropping \
-								 captured frames before encode to stay realtime."
-							);
-						}
-						last_drop_warn = Some(std::time::Instant::now());
-					}
+					warn_dropping_captures(&send_queue, &mut last_drop_warn);
 					continue;
 				}
 
@@ -1116,22 +1139,7 @@ impl VideoPipelineInner {
 						enabled: hdr_enabled,
 						metadata: frame_hdr_metadata,
 					};
-					if new_state != last_hdr_state {
-						if new_state.enabled {
-							match new_state.metadata {
-								Some(m) => tracing::info!(
-									"Content switched to HDR (BT.2020/PQ): maxCLL {} nits, maxFALL {} nits",
-									m.max_cll,
-									m.max_fall
-								),
-								None => tracing::info!("Content switched to HDR (BT.2020/PQ)"),
-							}
-						} else {
-							tracing::info!("Content switched to SDR (BT.709)");
-						}
-						last_hdr_state = new_state.clone();
-						let _ = hdr_metadata_tx.send(new_state);
-					}
+					forward_hdr_state(&mut last_hdr_state, new_state, &hdr_metadata_tx);
 				}
 
 				// The colour conversion runs on the GPU as part of the submit below;
@@ -1168,7 +1176,7 @@ impl VideoPipelineInner {
 						in_flight.fetch_add(1, Ordering::Relaxed);
 						submitted_count += 1;
 						let consumer_gone = frame_ctx_tx
-							.blocking_send(ConsumerMessage::Frame(frame_context, future))
+							.blocking_send(ConsumerMessage::Frame(frame_context, PendingFrame::Coded(future)))
 							.is_err();
 
 						// The encoder reads the frame after `submit` returns. Once it
@@ -1216,11 +1224,123 @@ impl VideoPipelineInner {
 	}
 }
 
+struct PacketConsumer {
+	/// Submitted frames, in order. Dropping it ends the consumer after the last frame.
+	frame_ctx_tx: mpsc::Sender<ConsumerMessage>,
+	/// Frames submitted but not yet taken by the network sender.
+	in_flight: Arc<AtomicUsize>,
+	/// Lets the drop warning tell a backed-up send queue (network) from frames
+	/// still encoding (GPU). Weak, so it doesn't keep the channel open.
+	send_queue: mpsc::WeakSender<PacketBatch>,
+	task: tokio::task::JoinHandle<()>,
+}
+
+impl VideoPipelineInner {
+	/// Spawn the packet consumer for this stream on the main runtime.
+	///
+	/// Each encoding loop hands its frames, together with their per-frame
+	/// context, to this consumer in submission order; the consumer awaits the
+	/// encoded output, packetizes and sends it, so packets go out as soon as the
+	/// GPU finishes, independent of the loop's cadence.
+	///
+	/// `in_flight` counts frames submitted but not yet taken by the network
+	/// sender. The encoding thread reads it to decide when to drop new captures
+	/// (see `MAX_FRAMES_IN_FLIGHT`); a frame's slot is released when the sender
+	/// takes its batch, or when the consumer drops it. The channel
+	/// is sized just above that gate so it never actually blocks the producer —
+	/// admission is governed by the drop gate, not by the channel filling.
+	fn spawn_packet_consumer(
+		&self,
+		runtime: &tokio::runtime::Handle,
+		packet_tx: mpsc::Sender<PacketBatch>,
+		stats_tx: StatsSender,
+		idr_tx: broadcast::Sender<()>,
+	) -> PacketConsumer {
+		let ctx = &self.context;
+		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
+		packetizer.warm_up(self.config.fec_percentage, ctx.minimum_fec_packets);
+
+		let in_flight = Arc::new(AtomicUsize::new(0));
+		let (frame_ctx_tx, frame_ctx_rx) = mpsc::channel::<ConsumerMessage>(MAX_FRAMES_IN_FLIGHT + 2);
+		let send_queue = packet_tx.downgrade();
+		// The packetize/send half is pure async work (await the encode future,
+		// packetize, send) with no blocking GPU calls, so it runs as a task on
+		// moonshine's main runtime — a green thread multiplexed with the rest of
+		// the session — rather than its own OS thread. Only the capture/encode
+		// loop needs a real thread, as it blocks on the frame channel and the
+		// Vulkan submit path.
+		let task = runtime.spawn(run_packet_consumer(
+			frame_ctx_rx,
+			packet_tx,
+			stats_tx,
+			in_flight.clone(),
+			idr_tx,
+			packetizer,
+			ctx.clone(),
+			self.config.clone(),
+		));
+
+		PacketConsumer {
+			frame_ctx_tx,
+			in_flight,
+			send_queue,
+			task,
+		}
+	}
+}
+
+/// Warn, at most once a second, that captures are being dropped before encode
+/// because every in-flight slot is taken.
+fn warn_dropping_captures(send_queue: &mpsc::WeakSender<PacketBatch>, last_warn: &mut Option<std::time::Instant>) {
+	if last_warn.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1)) {
+		return;
+	}
+	// Batches waiting for the sender hold slots only until it takes them,
+	// so any queued batch means the socket isn't draining.
+	let queued = send_queue.upgrade().map_or(0, |tx| tx.max_capacity() - tx.capacity());
+	if queued > 0 {
+		tracing::warn!(
+			queued,
+			"Video send backpressure: the network isn't keeping up; dropping \
+			 captured frames before encode to stay realtime."
+		);
+	} else {
+		tracing::warn!(
+			"Video encode backpressure: the encoder isn't keeping up; dropping \
+			 captured frames before encode to stay realtime."
+		);
+	}
+	*last_warn = Some(std::time::Instant::now());
+}
+
+fn forward_hdr_state(last: &mut HdrModeState, new: HdrModeState, tx: &watch::Sender<HdrModeState>) {
+	if new == *last {
+		return;
+	}
+	if new.enabled {
+		match new.metadata {
+			Some(m) => tracing::info!(
+				"Content switched to HDR (BT.2020/PQ): maxCLL {} nits, maxFALL {} nits",
+				m.max_cll,
+				m.max_fall
+			),
+			None => tracing::info!("Content switched to HDR (BT.2020/PQ)"),
+		}
+	} else {
+		tracing::info!("Content switched to SDR (BT.709)");
+	}
+	*last = new.clone();
+	let _ = tx.send(new);
+}
+
 #[cfg(test)]
 mod tests {
-	use super::drm_fourcc_to_input;
+	use super::*;
+	use crate::session::SessionKeyData;
+	use crate::session::stream::video::StreamEvent;
 	use ash::vk;
 	use pixelforge::RgbFormat;
+	use std::time::{Duration, Instant};
 
 	// DRM fourccs — kept in the test module to document the byte ordering
 	// explicitly and guard against accidental typos in the production match.
@@ -1272,5 +1392,101 @@ mod tests {
 		let (fmt, vk) = drm_fourcc_to_input(0xDEADBEEF);
 		assert_eq!(fmt, RgbFormat::BGRx);
 		assert_eq!(vk, vk::Format::B8G8R8A8_UNORM);
+	}
+
+	fn ready_frame(captured_at: Instant) -> ConsumerMessage {
+		ConsumerMessage::Frame(
+			FrameContext::immediate(captured_at),
+			PendingFrame::Ready(EncodedFrame {
+				data: Bytes::from_static(&[0x42; 100]),
+				is_key_frame: true,
+				record_layout: None,
+			}),
+		)
+	}
+
+	fn start_consumer(
+		frames: mpsc::Receiver<ConsumerMessage>,
+		packets: mpsc::Sender<PacketBatch>,
+		stats: StatsSender,
+		in_flight: Arc<AtomicUsize>,
+	) -> tokio::task::JoinHandle<()> {
+		let (_, keys) = watch::channel(SessionKeyData {
+			remote_input_key: Vec::new(),
+			remote_input_key_id: 0,
+		});
+		let (idr, _) = broadcast::channel(1);
+		tokio::spawn(run_packet_consumer(
+			frames,
+			packets,
+			stats,
+			in_flight,
+			idr,
+			Packetizer::new(false, keys),
+			VideoStreamContext {
+				fps: 60,
+				packet_size: 80,
+				..Default::default()
+			},
+			VideoStreamConfig {
+				fec_percentage: 0,
+				..Default::default()
+			},
+		))
+	}
+
+	#[tokio::test]
+	async fn ready_frames_share_ordered_transport_stats_and_admission() {
+		let (frames, input) = mpsc::channel(4);
+		let (output, mut packets) = mpsc::channel(4);
+		let stats = StatsSender::new(4);
+		let mut reports = stats.subscribe();
+		let in_flight = Arc::new(AtomicUsize::new(3));
+		let consumer = start_consumer(input, output, stats, in_flight.clone());
+		let start = Instant::now();
+		let step = Duration::from_millis(10);
+		frames.send(ready_frame(start)).await.unwrap();
+		frames.send(ready_frame(start + step)).await.unwrap();
+		frames.send(ConsumerMessage::ResetCounters(1)).await.unwrap();
+		frames.send(ready_frame(start + 2 * step)).await.unwrap();
+		drop(frames);
+		tokio::time::timeout(Duration::from_secs(2), consumer)
+			.await
+			.unwrap()
+			.unwrap();
+		// Queued batches keep their slots until the sender takes them.
+		assert_eq!(in_flight.load(Ordering::Relaxed), 3);
+		for (epoch, frame_number, timestamp, sequence) in [(0, 1, 0, 0), (0, 2, 900, 2), (1, 1, 1800, 0)] {
+			let (batch_epoch, batch) = packets.recv().await.unwrap().into_parts();
+			assert_eq!(batch_epoch, epoch);
+			let first = &batch.as_bytes()[..batch.shard_size()];
+			assert_eq!(u16::from_be_bytes(first[2..4].try_into().unwrap()), sequence);
+			assert_eq!(u32::from_be_bytes(first[4..8].try_into().unwrap()), timestamp);
+			assert_eq!(u32::from_le_bytes(first[20..24].try_into().unwrap()), frame_number);
+			let StreamEvent::Frame(report) = reports.recv().await.unwrap() else {
+				panic!("expected a frame event");
+			};
+			assert_eq!(report.frame_number, frame_number);
+			assert_eq!(report.encoded_bytes, 100);
+			assert!(report.is_key_frame);
+		}
+		assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+		assert!(packets.recv().await.is_none());
+	}
+
+	#[tokio::test]
+	async fn closed_packet_output_releases_the_ready_frame() {
+		let (frames, input) = mpsc::channel(1);
+		let (output, packets) = mpsc::channel(1);
+		let in_flight = Arc::new(AtomicUsize::new(1));
+		drop(packets);
+		let consumer = start_consumer(input, output, StatsSender::new(1), in_flight.clone());
+		frames.send(ready_frame(Instant::now())).await.unwrap();
+		tokio::time::timeout(Duration::from_secs(2), consumer)
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+		assert!(frames.is_closed());
 	}
 }

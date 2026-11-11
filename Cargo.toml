@@ -2,6 +2,9 @@
 members = [".", "tools"]
 resolver = "2"
 
+[workspace.dependencies]
+pyrowave = { git = "https://github.com/lutyjj/pyrowave-rs", rev = "f5d52fa69032c3c7754ddff2fa37e99cfe371e00" }
+
 [workspace.package]
 version = "0.16.1"
 
@@ -56,6 +59,7 @@ open = "5.3.5"
 opus = "0.3.1"
 pkcs8 = "0.11.0"
 pixelforge = { git = "https://github.com/hgaiser/pixelforge", tag = "v0.11.0", features = ["dmabuf"] }
+pyrowave = { workspace = true, features = ["dmabuf"] }
 pulseaudio = "0.3.1"
 rcgen = "0.14.8"
 rsa = "0.9.10"

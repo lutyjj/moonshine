@@ -83,4 +83,4 @@ The shell contains the full build environment, plus `clippy` and `rustfmt` as us
 
 ## Maintenance
 
-There is nothing here to keep up to date when dependencies change: the nix build derives everything from `Cargo.lock`. The one exception is a pinned hash for `ash` in [package.nix](package.nix). See the comment there.
+There is nothing here to keep up to date when dependencies change: the nix build derives everything from `Cargo.lock`. The one exception is the hash of the pyrowave-rs source in [package.nix](package.nix), bumped with its pin. See the comment there.
