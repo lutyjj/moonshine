@@ -45,6 +45,44 @@ fn fec_parameters(data_shards: usize, percentage: u8, minimum: u32) -> (usize, u
 	((data_shards * percentage).div_ceil(100), percentage)
 }
 
+/// One FEC block: data shards `[start, end)` and their parity. Clients derive
+/// the parity count as `ceil(data * fec_percentage / 100)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockPlan {
+	start: usize,
+	end: usize,
+	parity: usize,
+	fec_percentage: usize,
+}
+
+/// Blocks for a frame whose every packet is protected, or `None` if it has
+/// more packets than the wire can describe.
+///
+/// As few blocks as the percentage allows, split evenly so every block
+/// gets the same protection (RFC 5052, section 9.1). A frame that needs
+/// more than four blocks gets four larger ones, each with the parity that
+/// still fits, and none once a block is too large for any.
+fn plan_coded_blocks(nr_data_shards: usize, fec_percentage: u8, minimum_fec_packets: u32) -> Option<Vec<BlockPlan>> {
+	if nr_data_shards > MAX_FEC_BLOCKS * MAX_DATA_SHARDS_PER_BLOCK {
+		return None;
+	}
+	let data_shards_per_block = MAX_SHARDS * 100 / (100 + fec_percentage as usize);
+	let nr_blocks = nr_data_shards.div_ceil(data_shards_per_block).min(MAX_FEC_BLOCKS);
+	let (shards_per_block, larger_blocks) = (nr_data_shards / nr_blocks, nr_data_shards % nr_blocks);
+	let blocks = (0..nr_blocks).map(|block_index| {
+		let start = block_index * shards_per_block + block_index.min(larger_blocks);
+		let end = start + shards_per_block + usize::from(block_index < larger_blocks);
+		let (parity, fec_percentage) = fec_parameters(end - start, fec_percentage, minimum_fec_packets);
+		BlockPlan {
+			start,
+			end,
+			parity,
+			fec_percentage,
+		}
+	});
+	Some(blocks.collect())
+}
+
 #[repr(u8)]
 enum RtpFlag {
 	ContainsPicData = 0x1,
@@ -249,22 +287,14 @@ impl Packetizer {
 
 		let nr_data_shards = packet_data_len.div_ceil(requested_shard_payload_size);
 		assert!(nr_data_shards != 0);
-		if nr_data_shards > MAX_FEC_BLOCKS * MAX_DATA_SHARDS_PER_BLOCK {
+		let Some(plan) = plan_coded_blocks(nr_data_shards, fec_percentage, minimum_fec_packets) else {
 			tracing::warn!("Encoded frame {frame_number} needs {nr_data_shards} packets, exceeding the wire limit.");
 			return Err(());
-		}
-
-		// As few blocks as the percentage allows, split evenly so every block
-		// gets the same protection (RFC 5052, section 9.1). A frame that needs
-		// more than four blocks gets four larger ones, each with the parity that
-		// still fits, and none once a block is too large for any.
-		let data_shards_per_block = MAX_SHARDS * 100 / (100 + fec_percentage as usize);
-		let nr_blocks = nr_data_shards.div_ceil(data_shards_per_block).min(MAX_FEC_BLOCKS);
-		let (shards_per_block, larger_blocks) = (nr_data_shards / nr_blocks, nr_data_shards % nr_blocks);
+		};
 		// Last block occupies bits 6-7, current block bits 4-5.
-		let last_block_index = (nr_blocks as u8 - 1) << 6;
+		let last_block_index = (plan.len() as u8 - 1) << 6;
 
-		tracing::trace!("Sending {nr_blocks} blocks of video data.");
+		tracing::trace!("Sending {} blocks of video data.", plan.len());
 
 		// Accumulate all blocks into a single batch.
 		let mut all_shards = ShardBatch::empty();
@@ -276,15 +306,16 @@ impl Packetizer {
 		let mut total_fec_headers_us = 0u128;
 		let mut total_extend_us = 0u128;
 
-		for block_index in 0..nr_blocks {
-			let start = block_index * shards_per_block + block_index.min(larger_blocks);
-			let end = start + shards_per_block + usize::from(block_index < larger_blocks);
+		for (block_index, block) in plan.iter().enumerate() {
+			let BlockPlan {
+				start,
+				end,
+				parity: nr_parity_shards,
+				fec_percentage,
+			} = *block;
 
 			let nr_data_shards = end - start;
 			assert!(nr_data_shards != 0);
-
-			let (nr_parity_shards, fec_percentage) =
-				fec_parameters(nr_data_shards, fec_percentage, minimum_fec_packets);
 
 			let t_fec_encoder = Instant::now();
 			let encoder = if nr_parity_shards > 0 {
